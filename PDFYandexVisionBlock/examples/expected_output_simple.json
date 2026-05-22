@@ -1,0 +1,44 @@
+{
+  "success": true,
+  "document": {
+    "type": "Счёт",
+    "number": "ABC-123",
+    "date": "2026-05-22",
+    "total_amount": 25500.5
+  },
+  "counterparties": [
+    {
+      "name": "ООО «Ромашка",
+      "inn": "7701234567",
+      "kpp": "770101001",
+      "role": "seller"
+    },
+    {
+      "name": "ООО «Василек",
+      "inn": "7812345678",
+      "kpp": "781201001",
+      "role": "buyer"
+    }
+  ],
+  "items": [
+    {
+      "name": "Услуга разработки",
+      "quantity": 2.0,
+      "price": 10000.0,
+      "amount": 20000.0,
+      "unit": "шт"
+    },
+    {
+      "name": "Поддержка проекта",
+      "quantity": 1.0,
+      "price": 5500.5,
+      "amount": 5500.5,
+      "unit": "усл"
+    }
+  ],
+  "raw_text": "",
+  "warnings": [],
+  "meta": {
+    "parser_version": "2.0.0"
+  }
+}
