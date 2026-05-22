@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xml>
+  <category name="Обработка документов">
+    <category name="OCR">
+      <block type="pdf_yandex_vision"></block>
+    </category>
+  </category>
+</xml>

@@ -1,0 +1,61 @@
+{
+  "type": "pdf_yandex_vision",
+  "message0": "Распознать PDF через Yandex Vision %1 Токен %2 Каталог %3 Файл %4 Язык %5 Формат %6",
+  "args0": [
+    {
+      "type": "input_dummy"
+    },
+    {
+      "type": "input_value",
+      "name": "TOKEN",
+      "check": "String"
+    },
+    {
+      "type": "input_value",
+      "name": "FOLDER_ID",
+      "check": "String"
+    },
+    {
+      "type": "input_value",
+      "name": "FILE_PATH",
+      "check": "String"
+    },
+    {
+      "type": "field_dropdown",
+      "name": "LANGUAGE",
+      "options": [
+        [
+          "Русский",
+          "ru"
+        ],
+        [
+          "Английский",
+          "en"
+        ],
+        [
+          "Русский + Английский",
+          "ru-en"
+        ]
+      ]
+    },
+    {
+      "type": "field_dropdown",
+      "name": "OUTPUT_FORMAT",
+      "options": [
+        [
+          "dict",
+          "dict"
+        ],
+        [
+          "json",
+          "json"
+        ]
+      ]
+    }
+  ],
+  "inputsInline": false,
+  "output": null,
+  "colour": "#F9A825",
+  "tooltip": "Отправляет PDF в Yandex Vision и возвращает реквизиты",
+  "helpUrl": ""
+}
