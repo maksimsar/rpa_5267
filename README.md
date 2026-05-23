@@ -1,6 +1,6 @@
 # PDFYandexVisionBlock
 
-PDFYandexVisionBlock - хакатонный пользовательский блок Puzzle RPA для распознавания PDF-документов через Yandex Vision и извлечения реквизитов в `dict` или JSON.
+PDFYandexVisionBlock - пользовательский блок Puzzle RPA для распознавания PDF-документов через Yandex Vision и извлечения реквизитов в `dict` или JSON.
 
 Блок принимает PDF-файл, `TOKEN`, `FOLDER_ID`, язык OCR и формат вывода, отправляет документ в Yandex Vision API, получает OCR-ответ и возвращает результат без падения процесса при типовых ошибках.
 
@@ -12,7 +12,6 @@ PDFYandexVisionBlock - хакатонный пользовательский б�
 4. Обрабатывает ответ OCR или ошибку API.
 5. Возвращает результат как Python `dict` или JSON-строку.
 
-Текущий важный нюанс: расширенные `parser.py`, `normalizer.py` и `schema.py` уже есть и проверяются через parser demo. При этом `process_pdf(...)` в `PDFYandexVisionBlock/src/__init__.py` сейчас после OCR использует базовую встроенную структуризацию из этого же файла. Перед финальной демонстрацией через Puzzle RPA нужно убедиться, что entrypoint подключен к нужному формату результата.
 
 ## Извлекаемые поля
 
@@ -63,7 +62,7 @@ pdf-yandex-vision-rpa/
 └── demo_video_link.txt
 ```
 
-`examples/test_input.pdf` не хранится в репозитории. Реальный PDF добавляется локально перед live demo, если документ не содержит приватных данных или команда готова показывать его на записи.
+`examples/test_input.pdf` не хранится в репозитории. Реальный PDF добавляется локально перед live demo, если документ не содержит приватных данных.
 
 ## Параметры блока
 
@@ -78,14 +77,7 @@ pdf-yandex-vision-rpa/
 ## Установка в Puzzle RPA Studio
 
 1. Импортировать или скопировать папку `PDFYandexVisionBlock/` как пользовательское расширение Puzzle RPA Studio.
-2. Проверить, что внутри есть `block.json`, `meta.json`, `values.xml`, `code.value.py`, `typeToName.json`, `libs.py.json`, `requirements.txt`.
-3. Установить зависимости в Python-окружение Puzzle RPA:
-
-```powershell
-cd PDFYandexVisionBlock
-python -m pip install -r requirements.txt
-```
-
+2. Проверить, что внутри есть `block.json`, `meta.json`, `values.xml`, `code.value.py`, `typeToName.json`, `libs.py.json`.
 4. Перезапустить Studio или обновить список пользовательских блоков.
 5. Найти блок в категории `Обработка документов -> OCR`.
 
@@ -99,19 +91,6 @@ python -X utf8 tools\validate_output.py examples\expected_output.json
 ```
 
 `tools/smoke_test.py` проверяет структуру, импорт `process_pdf`, базовый JSON и offline-парсинг sample response. Live OCR не запускается без реальных `TOKEN`, `FOLDER_ID`, PDF и сети.
-
-## Старые dev-проверки
-
-Эти команды сохранены для совместимости и запускаются из `PDFYandexVisionBlock/`:
-
-```powershell
-python -B -m unittest discover -s tests
-python -X utf8 tools\run_parser_demo.py
-python -X utf8 tools\validate_output.py examples\demo_result.json
-python -X utf8 -c "from src import process_pdf; print(callable(process_pdf))"
-```
-
-`tools/run_parser_demo.py` генерирует `PDFYandexVisionBlock/examples/demo_result.json` из встроенного текста и показывает расширенный parser demo без обращения к Yandex Vision.
 
 ## Пример success JSON
 
@@ -163,25 +142,11 @@ python -X utf8 -c "from src import process_pdf; print(callable(process_pdf))"
 }
 ```
 
-## OAuth-токен и Folder ID
-
-Токен и `FOLDER_ID` команда получает в Yandex Cloud под аккаунтом, которому разрешен доступ к каталогу и Yandex Vision. Актуальные инструкции нужно сверять с официальной документацией Yandex Cloud:
-
-- OAuth-токены: <https://yandex.cloud/docs/iam/concepts/authorization/oauth-token>
-- Folder ID: <https://yandex.cloud/docs/resource-manager/operations/folder/get-id>
-
-Не сохраняйте реальные значения в репозитории, docs, screenshots или видео.
-
 ## Безопасность
 
 - Секреты не хранятся в коде.
 - `TOKEN` и `FOLDER_ID` передаются только как параметры робота или безопасные runtime-значения.
 - `.env`, `secrets.json`, файлы с token/credentials в названии не коммитятся.
-- Перед сдачей выполнить secret scan:
-
-```powershell
-rg -n -i -uu --glob "!.git/**" "y0_|bearer [a-z0-9_\-\.]+|oauth_token|real_token|secret|\.env" .
-```
 
 ## Частые ошибки
 
@@ -200,7 +165,6 @@ rg -n -i -uu --glob "!.git/**" "y0_|bearer [a-z0-9_\-\.]+|oauth_token|real_token
 - Для live OCR нужен интернет.
 - Для live OCR нужны реальные `TOKEN`, `FOLDER_ID` и PDF.
 - Качество скана влияет на OCR и итоговый парсинг.
-- `examples/test_input.pdf` может не храниться в репозитории, если содержит приватные данные.
 - Установку блока в Puzzle RPA Studio нужно проверить отдельно на машине демонстрации.
 
 ## Видео
