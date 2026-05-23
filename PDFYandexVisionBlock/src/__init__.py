@@ -35,6 +35,11 @@ def _error(code: str, message: str, details: Optional[str] = None) -> Dict[str, 
         },
     }
 
+def _format_result(result: Dict[str, Any], output_format: str):
+    if output_format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return result
+
 
 def _extract_text_from_response(response_json: Dict[str, Any]) -> str:
     """Минимальное извлечение текста из ответа Yandex Vision.
