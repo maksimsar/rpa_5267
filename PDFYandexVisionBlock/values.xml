@@ -1,8 +1,19 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<xml>
-  <category name="Обработка документов">
-    <category name="OCR">
-      <block type="PDFYandexVisionBlock"></block>
-    </category>
-  </category>
-</xml>
+<block type="PDFYandexVisionBlock">
+  <value name="TOKEN">
+    <shadow type="text">
+      <field name="TEXT"></field>
+    </shadow>
+  </value>
+
+  <value name="FOLDER_ID">
+    <shadow type="text">
+      <field name="TEXT"></field>
+    </shadow>
+  </value>
+
+  <value name="FILE_PATH">
+    <shadow type="text">
+      <field name="TEXT"></field>
+    </shadow>
+  </value>
+</block>
