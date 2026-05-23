@@ -9,6 +9,8 @@ try:
 except ModuleNotFoundError:
     requests = None
 
+from .yandex_client import call_yandex_vision
+
 try:
     from puzzle_logger import log_decorator, window_logger
 except Exception:
@@ -141,57 +143,19 @@ def process_pdf(
             result = _error("FILE_NOT_FOUND", "PDF-файл не найден", file_path)
             return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
 
-        with open(file_path, "rb") as f:
-            encoded_file = base64.b64encode(f.read()).decode("utf-8")
-
-        # Базовый payload. При необходимости адаптируйте поля под актуальный формат Yandex Vision.
-        payload = {
-            "folderId": folder_id,
-            "analyze_specs": [
-                {
-                    "content": encoded_file,
-                    "features": [
-                        {
-                            "type": "DOCUMENT_RECOGNITION",
-                            "documentRecognitionConfig": {
-                                "languageCodes": ["ru", "en"] if language == "ru-en" else [language]
-                            },
-                        }
-                    ],
-                }
-            ],
-        }
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
-
-        response = requests.post(
-            YANDEX_VISION_URL,
-            headers=headers,
-            json=payload,
+        vision_result = call_yandex_vision(
+            token=token,
+            folder_id=folder_id,
+            file_path=file_path,
+            language=language,
             timeout=timeout,
         )
 
-        if response.status_code in (401, 403):
-            result = _error("YANDEX_AUTH_ERROR", "Неверный токен или нет доступа к каталогу", response.text)
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+        if not vision_result.get("success"):
+            return json.dumps(vision_result, ensure_ascii=False) if output_format == "json" else vision_result
 
-        if response.status_code == 429:
-            result = _error("YANDEX_QUOTA_ERROR", "Превышена квота Yandex Vision", response.text)
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
-
-        if response.status_code >= 400:
-            result = _error("YANDEX_API_ERROR", f"Ошибка Yandex Vision: HTTP {response.status_code}", response.text)
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
-
-        try:
-            vision_json = response.json()
-        except Exception as exc:
-            result = _error("BAD_JSON_RESPONSE", "Yandex Vision вернул некорректный JSON", str(exc))
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
-
+        vision_json = vision_result["data"]
+        
         text = _extract_text_from_response(vision_json)
         parsed = _parse_requisites(text)
 
