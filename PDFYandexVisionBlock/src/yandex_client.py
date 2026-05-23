@@ -10,8 +10,81 @@ from .errors import make_error, make_success
 
 
 YANDEX_VISION_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+YANDEX_IAM_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 MAX_FILE_SIZE_MB = 20
 
+def _is_oauth_token(token: str) -> bool:
+    """
+    OAuth-токен Яндекса обычно начинается с y0_.
+    IAM-токен обычно начинается с t1.
+    """
+    return bool(token) and token.strip().startswith("y0_")
+
+
+def _get_iam_token(oauth_token: str, timeout: int = 15) -> Dict[str, Any]:
+    """
+    Получает IAM-токен по OAuth-токену.
+
+    Это нужно, чтобы пользователь мог передавать OAuth-токен через блок Puzzle RPA,
+    а код сам получал короткоживущий IAM-токен для Yandex Vision.
+    """
+    try:
+        response = requests.post(
+            YANDEX_IAM_URL,
+            json={"yandexPassportOauthToken": oauth_token},
+            timeout=timeout,
+        )
+
+        if response.status_code >= 400:
+            try:
+                details = response.json()
+            except ValueError:
+                details = response.text
+
+            return make_error(
+                "YANDEX_IAM_TOKEN_ERROR",
+                "Не удалось получить IAM-токен по OAuth-токену",
+                details,
+            )
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            return make_error(
+                "YANDEX_IAM_INVALID_JSON",
+                "Yandex IAM вернул некорректный JSON",
+                str(exc),
+            )
+
+        iam_token = data.get("iamToken")
+        if not iam_token:
+            return make_error(
+                "YANDEX_IAM_TOKEN_MISSING",
+                "Yandex IAM не вернул поле iamToken",
+                data,
+            )
+
+        return make_success(iam_token)
+
+    except requests.Timeout:
+        return make_error(
+            "YANDEX_IAM_TIMEOUT",
+            f"Yandex IAM не ответил за {timeout} секунд",
+        )
+
+    except requests.ConnectionError as exc:
+        return make_error(
+            "YANDEX_IAM_CONNECTION_ERROR",
+            "Нет соединения с Yandex IAM или отсутствует интернет",
+            str(exc),
+        )
+
+    except requests.RequestException as exc:
+        return make_error(
+            "YANDEX_IAM_REQUEST_ERROR",
+            "Ошибка HTTP-запроса к Yandex IAM",
+            str(exc),
+        )
 
 def _normalize_language(language: str) -> List[str]:
     """
@@ -89,8 +162,7 @@ def _build_payload(folder_id: str, encoded_pdf: str, language: str) -> Dict[str,
     """
     Формирует тело запроса к Yandex Vision.
 
-    По ТЗ хакатона используется batchAnalyze
-    и feature DOCUMENT_RECOGNITION.
+    Используется batchAnalyze и OCR-фича TEXT_DETECTION.
     """
     return {
         "folderId": folder_id,
@@ -100,9 +172,9 @@ def _build_payload(folder_id: str, encoded_pdf: str, language: str) -> Dict[str,
                 "mime_type": "application/pdf",
                 "features": [
                     {
-                        "type": "DOCUMENT_RECOGNITION",
-                        "documentRecognitionConfig": {
-                            "languageCodes": _normalize_language(language)
+                        "type": "TEXT_DETECTION",
+                        "text_detection_config": {
+                            "language_codes": _normalize_language(language)
                         },
                     }
                 ],
@@ -195,6 +267,14 @@ def call_yandex_vision(
             "EMPTY_TOKEN",
             "Не передан OAuth-токен Yandex Cloud",
         )
+
+    if _is_oauth_token(token):
+        iam_result = _get_iam_token(token, timeout=timeout)
+
+        if not iam_result.get("success"):
+            return iam_result
+
+        token = iam_result["data"]
 
     if not folder_id:
         return make_error(
