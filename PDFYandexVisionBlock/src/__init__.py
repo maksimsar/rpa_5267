@@ -1,8 +1,7 @@
-import base64
 import json
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:
     import requests
@@ -22,10 +21,7 @@ except Exception:
         return func
 
 
-YANDEX_VISION_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
-
-
-def _error(code: str, message: str, details: Optional[str] = None) -> Dict[str, Any]:
+def _error(code: str, message: str, details: Optional[Any] = None) -> Dict[str, Any]:
     return {
         "success": False,
         "error": {
@@ -35,25 +31,44 @@ def _error(code: str, message: str, details: Optional[str] = None) -> Dict[str, 
         },
     }
 
+
+def _clean_text(value: Any) -> str:
+    """
+    Очищает входы из Puzzle RPA от None, пробелов и случайных кавычек.
+    """
+    if value is None:
+        return ""
+    return str(value).strip().strip('"').strip("'")
+
+
 def _format_result(result: Dict[str, Any], output_format: str):
+    """
+    Возвращает результат в нужном формате: dict или красиво отформатированный JSON.
+    """
+    output_format = _clean_text(output_format).lower() or "dict"
+
     if output_format == "json":
         return json.dumps(result, ensure_ascii=False, indent=2)
+
     return result
 
 
 def _extract_text_from_response(response_json: Dict[str, Any]) -> str:
-    """Минимальное извлечение текста из ответа Yandex Vision.
-
-    В финальной версии эту функцию стоит расширить под полный формат ответа
-    DOCUMENT_RECOGNITION: страницы, блоки, строки, таблицы.
     """
-    chunks = []
+    Извлекает текст из ответа Yandex Vision.
+
+    Yandex может возвращать текст в разных вложенных структурах.
+    Поэтому проходим по JSON рекурсивно и забираем значения text/fullText.
+    """
+    chunks: List[str] = []
 
     def walk(obj: Any):
         if isinstance(obj, dict):
             for key, value in obj.items():
                 if key in ("text", "fullText") and isinstance(value, str):
-                    chunks.append(value)
+                    cleaned = value.strip()
+                    if cleaned:
+                        chunks.append(cleaned)
                 else:
                     walk(value)
         elif isinstance(obj, list):
@@ -61,55 +76,302 @@ def _extract_text_from_response(response_json: Dict[str, Any]) -> str:
                 walk(item)
 
     walk(response_json)
-    return "\n".join(dict.fromkeys(chunks))
+
+    unique_chunks = list(dict.fromkeys(chunks))
+    return "\n".join(unique_chunks)
+
+
+def _normalize_for_regex(text: str) -> str:
+    """
+    Делает OCR-текст удобным для regex-парсинга.
+    """
+    text = text or ""
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\\n", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _split_raw_text_lines(text: str, max_lines: int = 80) -> Dict[str, Any]:
+    """
+    Делает raw_text красивым для JSON.
+
+    Вместо одной огромной строки с \\n возвращаем:
+    - preview;
+    - список строк;
+    - количество строк;
+    - признак обрезки.
+    """
+    prepared = (text or "").replace("\\n", "\n")
+
+    lines = []
+    for line in prepared.splitlines():
+        cleaned = line.strip()
+        if cleaned:
+            lines.append(cleaned)
+
+    preview = " ".join(lines)
+    preview = re.sub(r"\s+", " ", preview).strip()
+
+    return {
+        "preview": preview[:1000],
+        "lines": lines[:max_lines],
+        "line_count": len(lines),
+        "truncated": len(lines) > max_lines,
+    }
+
+
+def _parse_amount(raw_value: str) -> Optional[float]:
+    """
+    Превращает сумму вида 15 800,50 или 15800.50 в float.
+    """
+    if not raw_value:
+        return None
+
+    cleaned = (
+        raw_value
+        .replace("\u00a0", "")
+        .replace(" ", "")
+        .replace(",", ".")
+        .strip()
+    )
+
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _find_total_amount(normalized: str) -> Optional[float]:
+    """
+    Ищет итоговую сумму.
+
+    Важно: сначала ищем суммы рядом с итоговыми словами.
+    Если не нашли, берём максимальную сумму из документа,
+    а не первую попавшуюся цену из таблицы.
+    """
+    priority_patterns = [
+        r"(?:Итого\s*к\s*оплате|Всего\s*к\s*оплате).{0,120}?([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))",
+        r"(?:Итого\s*без\s*НДС|Всего\s*без\s*НДС|Итого).{0,120}?([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))",
+        r"(?:Всего|Сумма).{0,120}?([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))",
+    ]
+
+    for pattern in priority_patterns:
+        matches = re.findall(pattern, normalized, flags=re.IGNORECASE)
+        parsed_values = [_parse_amount(value) for value in matches]
+        parsed_values = [value for value in parsed_values if value is not None]
+
+        if parsed_values:
+            return max(parsed_values)
+
+    all_amounts = re.findall(
+        r"\b([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))\s*(?:руб|р\.|₽)?\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    parsed_values = [_parse_amount(value) for value in all_amounts]
+    parsed_values = [value for value in parsed_values if value is not None]
+
+    if parsed_values:
+        return max(parsed_values)
+
+    return None
+
+
+def _find_party_name(normalized: str, label: str) -> Optional[str]:
+    """
+    Пытается извлечь название организации после Поставщик/Покупатель.
+    """
+    pattern = (
+        rf"{label}\s*[:\-]?\s*"
+        rf"(.{{2,120}}?)"
+        rf"(?=\s*(?:ИНН|КПП|Адрес|Поставщик|Покупатель|Основание|Назначение|$))"
+    )
+
+    match = re.search(pattern, normalized, flags=re.IGNORECASE)
+
+    if not match:
+        return None
+
+    name = match.group(1).strip(" :-")
+    name = re.sub(r"\s+", " ", name).strip()
+
+    if len(name) < 2:
+        return None
+
+    return name
+
+
+def _extract_counterparties(normalized: str) -> List[Dict[str, Any]]:
+    """
+    Извлекает поставщика и покупателя.
+
+    Сейчас это не полноценный бухгалтерский парсер,
+    но для чекпоинта вытаскивает основные ИНН/КПП гораздо стабильнее.
+    """
+    all_inn = re.findall(r"\b\d{10}|\b\d{12}", normalized)
+    all_kpp = re.findall(r"\b\d{9}\b", normalized)
+
+    supplier_name = _find_party_name(normalized, "Поставщик")
+    buyer_name = _find_party_name(normalized, "Покупатель")
+
+    supplier_inn_match = re.search(
+        r"(?:ИНН\s*поставщика|ИНН).{0,40}?(\d{10}|\d{12})",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    supplier_kpp_match = re.search(
+        r"(?:КПП).{0,40}?(\d{9})",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    buyer_match = re.search(
+        r"(?:Покупатель).{0,180}?(\d{10}|\d{12}).{0,40}?(\d{9})",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    counterparties: List[Dict[str, Any]] = []
+
+    supplier_inn = supplier_inn_match.group(1) if supplier_inn_match else (all_inn[0] if all_inn else None)
+    supplier_kpp = supplier_kpp_match.group(1) if supplier_kpp_match else (all_kpp[0] if all_kpp else None)
+
+    if supplier_name or supplier_inn or supplier_kpp:
+        counterparties.append(
+            {
+                "role": "supplier",
+                "name": supplier_name,
+                "inn": supplier_inn,
+                "kpp": supplier_kpp,
+            }
+        )
+
+    buyer_inn = None
+    buyer_kpp = None
+
+    if buyer_match:
+        buyer_inn = buyer_match.group(1)
+        buyer_kpp = buyer_match.group(2)
+    elif len(all_inn) > 1 or len(all_kpp) > 1:
+        buyer_inn = all_inn[1] if len(all_inn) > 1 else None
+        buyer_kpp = all_kpp[1] if len(all_kpp) > 1 else None
+
+    if buyer_name or buyer_inn or buyer_kpp:
+        counterparties.append(
+            {
+                "role": "buyer",
+                "name": buyer_name,
+                "inn": buyer_inn,
+                "kpp": buyer_kpp,
+            }
+        )
+
+    if not counterparties:
+        counterparties.append(
+            {
+                "role": None,
+                "name": None,
+                "inn": None,
+                "kpp": None,
+            }
+        )
+
+    return counterparties
+
+
+def _extract_items(normalized: str) -> List[Dict[str, Any]]:
+    """
+    Пробует извлечь табличные позиции.
+
+    Формат не идеальный, потому что OCR может ломать таблицы,
+    но для тестового счёта вытаскивает основные строки.
+    """
+    items: List[Dict[str, Any]] = []
+
+    item_pattern = re.compile(
+        r"\b(\d+)\s+"
+        r"(.{3,90}?)\s+"
+        r"(\d+(?:[,.]\d+)?)\s+"
+        r"(шт|усл|ед|pcs|service)\.?\s+"
+        r"([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))\s+"
+        r"([0-9]{1,3}(?:[\s\u00a0]?[0-9]{3})*(?:[,.]\d{2}))",
+        flags=re.IGNORECASE,
+    )
+
+    for match in item_pattern.finditer(normalized):
+        quantity_raw = match.group(3).replace(",", ".")
+
+        try:
+            quantity = float(quantity_raw)
+        except ValueError:
+            quantity = None
+
+        items.append(
+            {
+                "position": int(match.group(1)),
+                "name": re.sub(r"\s+", " ", match.group(2)).strip(),
+                "quantity": quantity,
+                "unit": match.group(4),
+                "price": _parse_amount(match.group(5)),
+                "amount": _parse_amount(match.group(6)),
+            }
+        )
+
+    return items
 
 
 def _parse_requisites(text: str) -> Dict[str, Any]:
-    """Базовый regex-парсер. Нужен как минимальная стартовая версия."""
-    normalized = re.sub(r"\s+", " ", text or "").strip()
+    """
+    Извлекает основные реквизиты из OCR-текста.
+    """
+    normalized = _normalize_for_regex(text)
 
     doc_type = None
     for candidate in ["УПД", "Акт", "Накладная", "Счёт", "Счет", "Договор"]:
         if re.search(candidate, normalized, flags=re.IGNORECASE):
-            doc_type = candidate
+            doc_type = "Счет" if candidate in ("Счёт", "Счет") else candidate
             break
 
-    number_match = re.search(r"(?:№|N|Номер[:\s]*)\s*([A-Za-zА-Яа-я0-9\-\/]+)", normalized, re.IGNORECASE)
-    date_match = re.search(r"\b(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b", normalized)
-    inn_match = re.search(r"\bИНН\s*[:№]?\s*(\d{10}|\d{12})\b", normalized, re.IGNORECASE)
-    kpp_match = re.search(r"\bКПП\s*[:№]?\s*(\d{9})\b", normalized, re.IGNORECASE)
-    amount_match = re.search(
-        r"(?:Итого|Всего|Сумма)\s*[:\-]?\s*([0-9\s]+(?:[,.]\d{2})?)",
+    number_match = re.search(
+        r"(?:№|N|Номер[:\s]*)\s*([A-Za-zА-Яа-я0-9\-\/]+)",
         normalized,
-        re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
-    amount = None
-    if amount_match:
-        raw_amount = amount_match.group(1).replace(" ", "").replace(",", ".")
-        try:
-            amount = float(raw_amount)
-        except ValueError:
-            amount = None
+    date_match = re.search(
+        r"\b(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b",
+        normalized,
+    )
+
+    total_amount = _find_total_amount(normalized)
+    counterparties = _extract_counterparties(normalized)
+    items = _extract_items(normalized)
+
+    warnings = []
+
+    if total_amount is None:
+        warnings.append("TOTAL_AMOUNT_NOT_FOUND")
+
+    if not counterparties or not any(item.get("inn") for item in counterparties):
+        warnings.append("INN_NOT_FOUND")
+
+    if not items:
+        warnings.append("ITEMS_NOT_FOUND_OR_TABLE_NOT_RECOGNIZED")
 
     return {
         "document": {
             "type": doc_type,
             "number": number_match.group(1) if number_match else None,
             "date": date_match.group(1) if date_match else None,
-            "total_amount": amount,
+            "total_amount": total_amount,
         },
-        "counterparties": [
-            {
-                "name": None,
-                "inn": inn_match.group(1) if inn_match else None,
-                "kpp": kpp_match.group(1) if kpp_match else None,
-                "role": None,
-            }
-        ],
-        "items": [],
-        "raw_text": text,
-        "warnings": [],
+        "counterparties": counterparties,
+        "items": items,
+        "raw_text": _split_raw_text_lines(text),
+        "warnings": warnings,
     }
 
 
@@ -122,12 +384,26 @@ def process_pdf(
     language: str = "ru",
     output_format: str = "dict",
     timeout: int = 45,
+    puzzle_logger_path=None,
+    block_text=None,
+    block_id=None,
+    window_log=False,
+    current_language=None,
+    **kwargs,
 ):
-    """Главная функция блока Puzzle RPA.
+    """
+    Главная функция блока Puzzle RPA.
 
-    Принимает PDF, отправляет в Yandex Vision, возвращает dict или JSON-строку.
+    Принимает PDF, отправляет в Yandex Vision,
+    парсит результат и возвращает dict или JSON-строку.
     """
     try:
+        token = _clean_text(token)
+        folder_id = _clean_text(folder_id)
+        file_path = _clean_text(file_path)
+        language = _clean_text(language) or "ru"
+        output_format = _clean_text(output_format).lower() or "dict"
+
         if requests is None:
             return _format_result(
                 _error(
@@ -136,17 +412,24 @@ def process_pdf(
                 ),
                 output_format,
             )
+
         if not token:
-            result = _error("EMPTY_TOKEN", "Не передан OAuth-токен Yandex Cloud")
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("EMPTY_TOKEN", "Не передан токен Yandex Cloud"),
+                output_format,
+            )
 
         if not folder_id:
-            result = _error("EMPTY_FOLDER_ID", "Не передан Folder ID Yandex Cloud")
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("EMPTY_FOLDER_ID", "Не передан Folder ID Yandex Cloud"),
+                output_format,
+            )
 
         if not file_path or not os.path.exists(file_path):
-            result = _error("FILE_NOT_FOUND", "PDF-файл не найден", file_path)
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("FILE_NOT_FOUND", "PDF-файл не найден", file_path),
+                output_format,
+            )
 
         vision_result = call_yandex_vision(
             token=token,
@@ -157,7 +440,7 @@ def process_pdf(
         )
 
         if not vision_result.get("success"):
-            return json.dumps(vision_result, ensure_ascii=False) if output_format == "json" else vision_result
+            return _format_result(vision_result, output_format)
 
         vision_json = vision_result["data"]
 
@@ -169,16 +452,10 @@ def process_pdf(
             **parsed,
         }
 
-        return json.dumps(result, ensure_ascii=False, indent=2) if output_format == "json" else result
-
-    except requests.Timeout:
-        result = _error("TIMEOUT", "Yandex Vision не ответил за отведённое время")
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
-
-    except requests.RequestException as exc:
-        result = _error("NETWORK_ERROR", "Сетевая ошибка при обращении к Yandex Vision", str(exc))
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+        return _format_result(result, output_format)
 
     except Exception as exc:
-        result = _error("UNKNOWN_ERROR", "Непредвиденная ошибка блока", str(exc))
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+        return _format_result(
+            _error("UNKNOWN_ERROR", "Непредвиденная ошибка блока", str(exc)),
+            output_format if "output_format" in locals() else "dict",
+        )

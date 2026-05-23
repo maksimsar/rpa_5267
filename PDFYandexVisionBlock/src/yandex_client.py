@@ -13,6 +13,15 @@ YANDEX_VISION_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
 YANDEX_IAM_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
 MAX_FILE_SIZE_MB = 20
 
+def _clean_text(value: Any) -> str:
+    """
+    Приводит вход из Puzzle RPA к обычной строке:
+    убирает None, пробелы и случайные кавычки по краям.
+    """
+    if value is None:
+        return ""
+    return str(value).strip().strip('"').strip("'")
+
 def _is_oauth_token(token: str) -> bool:
     """
     OAuth-токен Яндекса обычно начинается с y0_.
@@ -262,10 +271,15 @@ def call_yandex_vision(
         }
     }
     """
+    token = _clean_text(token)
+    folder_id = _clean_text(folder_id)
+    file_path = _clean_text(file_path)
+    language = _clean_text(language) or "ru"
+
     if not token:
         return make_error(
             "EMPTY_TOKEN",
-            "Не передан OAuth-токен Yandex Cloud",
+            "Не передан токен Yandex Cloud",
         )
 
     if _is_oauth_token(token):
