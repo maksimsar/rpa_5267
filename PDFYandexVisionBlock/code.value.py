@@ -1,9 +1,1 @@
-from PDFYandexVisionBlock.src import process_pdf
-
-process_pdf(
-    TOKEN,
-    FOLDER_ID,
-    FILE_PATH,
-    LANGUAGE,
-    OUTPUT_FORMAT
-)
+PDFYandexVisionBlock.process_pdf(${vc('TOKEN')}, ${vc('FOLDER_ID')}, ${vc('FILE_PATH')}, '${fv('LANGUAGE')}', '${fv('OUTPUT_FORMAT')}', #isInternalLog))

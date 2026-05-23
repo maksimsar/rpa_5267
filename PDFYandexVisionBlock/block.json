@@ -1,5 +1,5 @@
 {
-  "type": "pdf_yandex_vision",
+  "type": "PDFYandexVisionBlock",
   "message0": "Распознать PDF через Yandex Vision %1 Токен %2 Каталог %3 Файл %4 Язык %5 Формат %6",
   "args0": [
     {
