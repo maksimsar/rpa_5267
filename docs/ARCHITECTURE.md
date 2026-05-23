@@ -1,21 +1,24 @@
 # ARCHITECTURE
 
-PDFYandexVisionBlock состоит из Puzzle RPA слоя, Python entrypoint, API-клиента Yandex Vision, слоя ошибок, парсера, нормализации и схемы результата.
+PDFYandexVisionBlock разделен на Puzzle RPA extension, Python-логику блока, root-level слой сдачи и документацию.
 
-## Общая схема
+## Поток данных
 
 ```text
 Puzzle RPA block
-→ code.value.py
-→ process_pdf(...)
+→ PDFYandexVisionBlock/code.value.py
+→ PDFYandexVisionBlock/src/process_pdf(...)
 → yandex_client.call_yandex_vision(...)
 → Yandex Vision API
-→ parser
-→ normalizer
+→ parser.py
+→ normalizer.py
+→ schema.py
 → dict/json result
 ```
 
-## Слои решения
+Текущий интеграционный риск: расширенные `parser.py`, `normalizer.py` и `schema.py` уже есть и покрыты проверками, но `process_pdf(...)` в `PDFYandexVisionBlock/src/__init__.py` сейчас после OCR использует базовую встроенную структуризацию из `src/__init__.py`. Перед live Puzzle RPA demo нужно подтвердить, какой формат результата должен возвращать entrypoint.
+
+## Слои
 
 ### Puzzle RPA слой
 
@@ -26,93 +29,73 @@ Puzzle RPA block
 - `PDFYandexVisionBlock/code.value.py`
 - `PDFYandexVisionBlock/meta.json`
 - `PDFYandexVisionBlock/typeToName.json`
+- `PDFYandexVisionBlock/libs.py.json`
 
-Этот слой описывает визуальный блок, категорию `Обработка документов -> OCR`, входные параметры и вызов Python-функции `process_pdf(...)`.
+Слой отвечает за описание визуального блока, категорию `Обработка документов -> OCR`, входные параметры `TOKEN`, `FOLDER_ID`, `FILE_PATH`, `LANGUAGE`, `OUTPUT_FORMAT` и вызов `process_pdf(...)`.
 
-### API-слой
+### API слой
 
 Файл: `PDFYandexVisionBlock/src/yandex_client.py`.
 
-Задачи:
+Задачи: проверить PDF, собрать payload, вызвать Yandex Vision, обработать HTTP-ошибки, timeout и некорректный JSON.
 
-- проверить PDF-файл;
-- прочитать PDF и подготовить payload;
-- отправить запрос в Yandex Vision;
-- обработать HTTP-ошибки и некорректный JSON;
-- вернуть единый результат `success: true/false`.
-
-### Слой ошибок
+### Error handling слой
 
 Файл: `PDFYandexVisionBlock/src/errors.py`.
 
-Содержит helpers для единого формата:
+Слой задает единый формат `success: false` с `error.code`, `error.message`, `error.details`.
 
-```json
-{
-  "success": false,
-  "error": {
-    "code": "...",
-    "message": "...",
-    "details": "..."
-  }
-}
-```
-
-### Слой парсинга
+### Parser слой
 
 Файл: `PDFYandexVisionBlock/src/parser.py`.
 
-Парсер извлекает из текста или OCR-ответа:
+Извлекает тип документа, номер, дату, сумму, контрагентов, ИНН/КПП и табличные позиции из текста или OCR-ответа.
 
-- тип документа;
-- номер;
-- дату;
-- сумму;
-- контрагентов;
-- ИНН и КПП;
-- табличные позиции.
-
-### Слой нормализации
+### Normalizer слой
 
 Файл: `PDFYandexVisionBlock/src/normalizer.py`.
 
-Нормализует даты, суммы, ИНН, КПП, названия организаций, единицы измерения и OCR-артефакты.
+Нормализует даты, суммы, ИНН, КПП, названия организаций, единицы измерения и типовые OCR-артефакты.
 
-### Схема результата
+### Schema/result слой
 
 Файл: `PDFYandexVisionBlock/src/schema.py`.
 
-Задает dataclass-структуры результата, включая `FieldValue` с `value`, `confidence` и `source`. Это полезно для защиты: видно не только значение, но и способ его извлечения.
+Описывает расширенный результат с `value`, `confidence` и `source`, чтобы результат был понятен на защите и проверяем в тестах.
 
-### Инструменты проверки
+### Examples слой
 
-Файлы:
+Root `examples/` предназначен для жюри и упаковки:
 
-- `PDFYandexVisionBlock/tools/run_parser_demo.py`
-- `PDFYandexVisionBlock/tools/validate_output.py`
+- `examples/sample_response_yandex.json` - пример ответа OCR;
+- `examples/expected_output.json` - ожидаемый JSON для root validator;
+- `examples/README_TEST_INPUT.md` - почему реальный `test_input.pdf` не хранится в репозитории.
 
-`run_parser_demo.py` запускает расширенный parser demo без Puzzle RPA и без Yandex Vision. `validate_output.py` проверяет JSON на соответствие расширенной схеме.
+Старые dev-примеры сохранены в `PDFYandexVisionBlock/examples/`.
 
-## Почему архитектура расширяемая
+### Tools/checking слой
 
-- Puzzle RPA слой отделен от Python-логики.
-- API-клиент отделен от parser/normalizer.
-- Ошибки имеют единый формат и не завязаны на конкретный UI.
-- Parser и normalizer можно развивать отдельно от сетевого вызова.
-- Schema фиксирует контракт результата и упрощает тестирование.
+Root `tools/` предназначен для быстрой проверки сдачи:
 
-## Где менять OCR-провайдера
+- `tools/smoke_test.py`
+- `tools/validate_output.py`
 
-Замену OCR-провайдера лучше делать в API-слое: добавить новый клиент рядом с `yandex_client.py` или заменить реализацию вызова в `process_pdf(...)`, сохранив тот же формат успешного OCR-ответа или адаптер к `parser.py`.
+Старые dev-tools сохранены в `PDFYandexVisionBlock/tools/` для обратной совместимости.
 
-## Где улучшать парсер
+### Docs/demo слой
 
-Парсер улучшается в `PDFYandexVisionBlock/src/parser.py`, а нормализация значений - в `PDFYandexVisionBlock/src/normalizer.py`. Тесты лежат в `PDFYandexVisionBlock/tests/`.
+`docs/`, `README.md`, `CHECKPOINTS.md` и `demo_video_link.txt` описывают установку, демонстрацию, troubleshooting и чек-лист защиты.
 
-## Где менять формат результата
+## Почему root-level tools/examples удобны для жюри
 
-Формат результата описан в `PDFYandexVisionBlock/src/schema.py`. Проверка расширенного JSON находится в `PDFYandexVisionBlock/tools/validate_output.py`.
+- Проверки запускаются из корня проекта без знания внутренней структуры блока.
+- `examples/expected_output.json` дает готовый результат для просмотра.
+- `tools/smoke_test.py` не требует секретов и сети.
+- Внутренняя Puzzle RPA папка остается чистым extension-пакетом.
 
-## Текущий интеграционный риск
+## Точки расширения
 
-Расширенные `parser.py`, `normalizer.py` и `schema.py` уже есть в проекте и покрыты тестами. Перед финальной сборкой нужно убедиться, что `process_pdf(...)` в `PDFYandexVisionBlock/src/__init__.py` использует именно эту расширенную цепочку, если команда хочет получать расширенный формат напрямую из Puzzle RPA entrypoint.
+- OCR-провайдера менять в API-слое или через адаптер рядом с `yandex_client.py`.
+- Парсер улучшать в `parser.py`, нормализацию - в `normalizer.py`.
+- Формат результата менять в `schema.py` и валидаторах.
+- Puzzle RPA UI менять в `block.json`, `values.xml` и связанных meta-файлах.
