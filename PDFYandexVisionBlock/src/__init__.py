@@ -4,7 +4,10 @@ import os
 import re
 from typing import Any, Dict, Optional
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    requests = None
 
 from .yandex_client import call_yandex_vision
 
@@ -120,6 +123,14 @@ def process_pdf(
     Принимает PDF, отправляет в Yandex Vision, возвращает dict или JSON-строку.
     """
     try:
+        if requests is None:
+            return _format_result(
+                _error(
+                    "MISSING_DEPENDENCY",
+                    "Не установлена библиотека requests. Выполните: python -m pip install -r requirements.txt",
+                ),
+                output_format,
+            )
         if not token:
             result = _error("EMPTY_TOKEN", "Не передан OAuth-токен Yandex Cloud")
             return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
