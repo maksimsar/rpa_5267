@@ -11,7 +11,7 @@
     </shadow>
   </value>
 
-  <value name="FILE_PATH">
+  <value name="path_file">
     <shadow type="text">
       <field name="TEXT"></field>
     </shadow>
