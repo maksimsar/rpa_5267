@@ -6,3 +6,11 @@ __pycache__/
 *.log
 .DS_Store
 venv/
+secrets.json
+*token*
+*credentials*
+*.tmp
+*.bak
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
