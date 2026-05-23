@@ -116,7 +116,12 @@ def process_pdf(
     file_path: str,
     language: str = "ru",
     output_format: str = "dict",
+    puzzle_logger_path=None,
+    block_text=None,
+    block_id=None,
+    window_log=False,
     timeout: int = 45,
+    **kwargs,
 ):
     """Главная функция блока Puzzle RPA.
 
@@ -177,3 +182,8 @@ def process_pdf(
     except Exception as exc:
         result = _error("UNKNOWN_ERROR", "Непредвиденная ошибка блока", str(exc))
         return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+    
+def _format_result(result: Dict[str, Any], output_format: str):
+    if output_format == "json":
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    return result

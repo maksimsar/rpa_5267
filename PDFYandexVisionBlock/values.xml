@@ -2,7 +2,7 @@
 <xml>
   <category name="Обработка документов">
     <category name="OCR">
-      <block type="pdf_yandex_vision"></block>
+      <block type="PDFYandexVisionBlock"></block>
     </category>
   </category>
 </xml>
