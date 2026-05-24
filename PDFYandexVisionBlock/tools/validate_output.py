@@ -1,11 +1,4 @@
-"""
-tools/validate_output.py
-
-Строгий валидатор результата parse_requisites.
-
-Запуск:
-    python tools/validate_output.py examples/demo_result.json
-"""
+# Валидатор расширенного результата parser.py.
 
 from __future__ import annotations
 

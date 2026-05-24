@@ -1,9 +1,4 @@
-"""
-Offline smoke test for the root-level handoff structure.
-
-Usage:
-    python -X utf8 tools\\smoke_test.py
-"""
+# Локальная smoke-проверка структуры проекта.
 
 from __future__ import annotations
 
