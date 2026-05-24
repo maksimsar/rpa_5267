@@ -1,190 +1,221 @@
 """
 parser.py
 
-Максимально автономный слой извлечения реквизитов:
-Yandex Vision JSON / OCR text -> структурированный dict.
+Автономный слой парсинга OCR-результата.
 
-Ключевые идеи:
-1. Safe-by-design: парсер не должен падать на пустых/битых данных.
-2. Explainability: каждое поле имеет confidence/source.
-3. Priority extraction: fullText -> lines -> words, чтобы не плодить дубли.
-4. Fallback extraction: если нет таблиц в JSON, пытаемся разобрать строки текста.
-5. Testability: нет HTTP, файловой системы и Puzzle RPA.
-
-Python: 3.11+
-Dependencies: стандартная библиотека.
+Главная идея:
+- parse_requisites(...) возвращает explainable-формат для тестов и архитектуры:
+  {"value": ..., "confidence": ..., "source": ...}
+- parse_requisites_simple(...) возвращает компактный формат для Puzzle RPA.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-try:
-    from .normalizer import (
-        amounts_close,
-        normalize_amount,
-        normalize_date,
-        normalize_document_number,
-        normalize_for_search,
-        normalize_inn,
-        normalize_kpp,
-        normalize_org_name,
-        normalize_single_line,
-        normalize_text,
-        normalize_unit,
-    )
-    from .schema import Counterparty, DocumentInfo, FieldValue, LineItem, ParseResult, field
-except ImportError:
-    from normalizer import (  # type: ignore
-        amounts_close,
-        normalize_amount,
-        normalize_date,
-        normalize_document_number,
-        normalize_for_search,
-        normalize_inn,
-        normalize_kpp,
-        normalize_org_name,
-        normalize_single_line,
-        normalize_text,
-        normalize_unit,
-    )
-    from schema import Counterparty, DocumentInfo, FieldValue, LineItem, ParseResult, field  # type: ignore
+from typing import Any, Dict, Iterable, List, Optional
 
 
-PARSER_VERSION = "2.0.0"
+PARSER_VERSION = "4.0.0"
 
-DOC_TYPE_PATTERNS: Sequence[Tuple[str, str, float]] = (
-    ("УПД", r"\b(?:упд|универсальн\w+\s+передаточн\w+\s+документ)\b", 0.97),
-    ("Счет-фактура", r"\b(?:сч[её]т[\s-]*фактура)\b", 0.94),
-    ("Счёт", r"\b(?:сч[её]т(?:\s+на\s+оплату)?)\b", 0.92),
-    ("Акт", r"\b(?:акт(?:\s+выполненных\s+работ|\s+оказанных\s+услуг)?)\b", 0.9),
-    ("Накладная", r"\b(?:товарная\s+накладная|накладная|торг-?12)\b", 0.9),
-    ("Договор", r"\b(?:договор(?:\s+поставки|\s+оказания\s+услуг|\s+подряда)?)\b", 0.86),
-)
 
-NUMBER_PATTERNS: Sequence[Tuple[str, float]] = (
-    (
-        r"(?:№|n[oо]?\.?|номер(?:\s+документа)?)\s*[:\-]?\s*"
-        r"([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9_.\-\/\\]*)",
-        0.92,
-    ),
-    (
-        r"(?:сч[её]т|акт|накладная|упд|договор|сч[её]т[\s-]*фактура)"
-        r".{0,80}?\b(?:№|n[oо]?\.?|номер)\s*[:\-]?\s*"
-        r"([A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9_.\-\/\\]*)",
-        0.9,
-    ),
-)
-
-DATE_PATTERNS: Sequence[Tuple[str, float]] = (
-    (r"(?:от|дата|дата\s+составления)\s*[:\-]?\s*((?:«?\d{1,2}»?\s+[а-яё]+\s+\d{2,4})|(?:\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})|(?:\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2}))", 0.92),
-    (r"\b(«?\d{1,2}»?\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+\d{2,4}\s*(?:г\.?|года)?)\b", 0.86),
-    (r"\b(\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4})\b", 0.78),
-    (r"\b(\d{4}[.\-/]\d{1,2}[.\-/]\d{1,2})\b", 0.78),
-)
-
-AMOUNT_VALUE = r"(?:-?\d[\d\s.]*-\d{2}|-?\d[\d\s.,]*(?:\s*(?:руб\.?|рублей|рубля|р\.?|₽)\s*\d{1,2}\s*(?:коп\.?|копеек|копейки|к\.?)?)?)"
-
-AMOUNT_PATTERNS: Sequence[Tuple[str, float]] = (
-    (rf"(?:итого\s+к\s+оплате|всего\s+к\s+оплате|сумма\s+к\s+оплате)\s*[:\-]?\s*({AMOUNT_VALUE})", 0.98),
-    (rf"(?:итого\s+с\s+ндс|всего\s+с\s+ндс|итого\s+по\s+счету|итого\s+по\s+документу)\s*[:\-]?\s*({AMOUNT_VALUE})", 0.96),
-    (rf"(?:всего\s+наименований\s+\d+\s*,?\s*на\s+сумму)\s*({AMOUNT_VALUE})", 0.95),
-    (rf"(?:итого|всего|сумма)\s*[:\-]?\s*({AMOUNT_VALUE})", 0.88),
-    (rf"(?:на\s+сумму)\s*[:\-]?\s*({AMOUNT_VALUE})", 0.78),
-)
-
-INN_PATTERN = re.compile(r"\b(?:ИНН|ИИН)\s*[:№\-]?\s*(\d[\d\s\-]{8,16}\d)\b", re.IGNORECASE)
-KPP_PATTERN = re.compile(r"\b(?:КПП|KПП)\s*[:№\-]?\s*(\d[\d\s\-]{7,12}\d)\b", re.IGNORECASE)
-
-ROLE_KEYWORDS: Dict[str, str] = {
-    "поставщик": "seller",
-    "продавец": "seller",
-    "исполнитель": "executor",
-    "подрядчик": "executor",
-    "покупатель": "buyer",
-    "заказчик": "customer",
-    "плательщик": "payer",
-    "грузополучатель": "consignee",
-}
-
-ROLE_WORDS = "|".join(sorted(ROLE_KEYWORDS, key=len, reverse=True))
-
-MONEY_NUMBER_PATTERN = re.compile(
-    r"(?<![\w./-])"
-    r"-?\d{1,3}(?:[ \u00a0\u202f]\d{3})*(?:[,.]\d{1,2})?"
-    r"|(?<![\w./-])-?\d+(?:[,.]\d{1,2})?",
-    re.IGNORECASE,
-)
-
-ITEM_NUMBER_PATTERN = re.compile(
-    r"(?<![\w./-])"
-    r"(?:-?\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?:[,.]\d{1,2})|-?\d+(?:[,.]\d{1,2})?)"
-    r"(?![\w./-])",
-    re.IGNORECASE,
-)
-
-UNIT_PATTERN = re.compile(r"\b(шт\.?|усл\.?|ед\.?|кг|м2|м²|час(?:а|ов)?|компл\.?)\b", re.IGNORECASE)
-
-HEADER_ALIASES = {
-    "name": ("наименование", "товар", "работ", "услуг", "описание", "номенклатура"),
-    "quantity": ("кол", "кол-во", "количество", "qty"),
-    "unit": ("ед", "ед.", "единица", "единицы", "изм"),
-    "price": ("цена", "price"),
-    "amount": ("сумма", "стоимость", "amount", "итого"),
-}
+def _field(value: Any = None, confidence: float = 0.0, source: str = "not_found") -> Dict[str, Any]:
+    return {
+        "value": value,
+        "confidence": round(float(confidence), 3),
+        "source": source,
+    }
 
 
 def parse_requisites(vision_response: Dict[str, Any] | str | None) -> Dict[str, Any]:
-    """Публичная функция: результат с confidence/source."""
-    return parse_requisites_result(vision_response).to_dict(include_explainability=True)
+    """
+    Возвращает explainable-формат:
+    каждое значимое поле лежит в {"value", "confidence", "source"}.
+
+    Этот формат ждут unit-тесты и он удобен для защиты:
+    можно объяснить, как именно найдено поле.
+    """
+    compact = parse_requisites_simple(vision_response)
+    return make_explainable_result(compact)
 
 
 def parse_requisites_simple(vision_response: Dict[str, Any] | str | None) -> Dict[str, Any]:
-    """Публичная функция: компактный результат без confidence/source."""
-    return parse_requisites_result(vision_response).to_dict(include_explainability=False)
-
-
-def parse_requisites_result(vision_response: Dict[str, Any] | str | None) -> ParseResult:
+    """
+    Возвращает компактный формат для Puzzle RPA:
+    document.type -> "Счёт", а не {"value": "Счёт", ...}.
+    """
     raw_text = extract_text_from_vision_response(vision_response)
-    text = normalize_text(raw_text)
-    flat = normalize_single_line(text)
-
-    document = DocumentInfo(
-        type=_find_document_type(flat),
-        number=_find_document_number(flat),
-        date=_find_document_date(flat),
-        total_amount=_find_total_amount(flat),
-    )
-
     table_rows = extract_table_rows_from_vision_response(vision_response)
-    counterparties = _find_counterparties(text)
-    items = _find_items(text, table_rows=table_rows)
-    warnings = _build_warnings(document, counterparties, items)
+    parsed = parse_text(raw_text, table_rows=table_rows)
 
-    return ParseResult(
-        success=True,
-        document=document,
-        counterparties=counterparties,
-        items=items,
-        raw_text=text,
-        warnings=warnings,
-        meta={
+    return {
+        "success": True,
+        **parsed,
+        "meta": {
             "parser_version": PARSER_VERSION,
-            "items_count": len(items),
-            "counterparties_count": len(counterparties),
-            "table_rows_detected": len(table_rows),
-            "input_kind": type(vision_response).__name__,
+            "raw_text_length": len(raw_text or ""),
+            "items_count": len(parsed.get("items", [])),
+            "counterparties_count": len(parsed.get("counterparties", [])),
         },
-    )
+    }
+
+
+class ParserResult(dict):
+    """
+    Совместимость с кодом, который мог ждать .to_dict().
+    """
+    def to_dict(self, include_explainability: bool = True) -> Dict[str, Any]:
+        if include_explainability:
+            return dict(self)
+
+        return make_compact_from_explainable(dict(self))
+
+
+def parse_requisites_result(vision_response: Dict[str, Any] | str | None) -> ParserResult:
+    return ParserResult(parse_requisites(vision_response))
+
+
+def make_explainable_result(compact: Dict[str, Any]) -> Dict[str, Any]:
+    document = compact.get("document") or {}
+
+    explainable_counterparties = []
+
+    for party in compact.get("counterparties", []):
+        explainable_counterparties.append(
+            {
+                "name": _field(
+                    party.get("name"),
+                    0.85 if party.get("name") else 0.0,
+                    "role_section" if party.get("name") else "not_found",
+                ),
+                "inn": _field(
+                    party.get("inn"),
+                    0.95 if party.get("inn") else 0.0,
+                    "inn_regex" if party.get("inn") else "not_found",
+                ),
+                "kpp": _field(
+                    party.get("kpp"),
+                    0.95 if party.get("kpp") else 0.0,
+                    "kpp_regex" if party.get("kpp") else "not_found",
+                ),
+                "role": party.get("role") or "unknown",
+            }
+        )
+
+    explainable_items = []
+
+    for item in compact.get("items", []):
+        explainable = {
+            "name": _field(
+                item.get("name"),
+                0.85 if item.get("name") else 0.0,
+                "table_or_line_item",
+            ),
+            "quantity": _field(
+                item.get("quantity"),
+                0.85 if item.get("quantity") is not None else 0.0,
+                "table_or_line_item",
+            ),
+            "price": _field(
+                item.get("price"),
+                0.85 if item.get("price") is not None else 0.0,
+                "table_or_line_item",
+            ),
+            "amount": _field(
+                item.get("amount"),
+                0.85 if item.get("amount") is not None else 0.0,
+                "table_or_line_item",
+            ),
+            "unit": _field(
+                item.get("unit"),
+                0.8 if item.get("unit") else 0.0,
+                "table_or_line_item",
+            ),
+        }
+
+        if "position" in item:
+            explainable["position"] = item["position"]
+
+        explainable_items.append(explainable)
+
+    return {
+        "success": bool(compact.get("success", True)),
+        "document": {
+            "type": _field(
+                document.get("type"),
+                0.9 if document.get("type") else 0.0,
+                "document_type_regex" if document.get("type") else "not_found",
+            ),
+            "number": _field(
+                document.get("number"),
+                0.9 if document.get("number") else 0.0,
+                "document_number_regex" if document.get("number") else "not_found",
+            ),
+            "date": _field(
+                document.get("date"),
+                0.9 if document.get("date") else 0.0,
+                "date_regex" if document.get("date") else "not_found",
+            ),
+            "total_amount": _field(
+                document.get("total_amount"),
+                0.9 if document.get("total_amount") is not None else 0.0,
+                "amount_regex" if document.get("total_amount") is not None else "not_found",
+            ),
+        },
+        "counterparties": explainable_counterparties,
+        "items": explainable_items,
+        "raw_text": (
+            compact.get("raw_text", {}).get("preview", "")
+            if isinstance(compact.get("raw_text"), dict)
+            else compact.get("raw_text", "")
+        ),
+        "warnings": list(compact.get("warnings", [])),
+        "meta": dict(compact.get("meta", {})),
+    }
+
+
+def make_compact_from_explainable(explainable: Dict[str, Any]) -> Dict[str, Any]:
+    def value(obj: Any) -> Any:
+        if isinstance(obj, dict) and "value" in obj:
+            return obj.get("value")
+        return obj
+
+    document = explainable.get("document", {})
+
+    return {
+        "success": explainable.get("success", True),
+        "document": {
+            "type": value(document.get("type")),
+            "number": value(document.get("number")),
+            "date": value(document.get("date")),
+            "total_amount": value(document.get("total_amount")),
+        },
+        "counterparties": [
+            {
+                "role": party.get("role"),
+                "name": value(party.get("name")),
+                "inn": value(party.get("inn")),
+                "kpp": value(party.get("kpp")),
+            }
+            for party in explainable.get("counterparties", [])
+        ],
+        "items": [
+            {
+                **({"position": item.get("position")} if item.get("position") is not None else {}),
+                "name": value(item.get("name")),
+                "quantity": value(item.get("quantity")),
+                "unit": value(item.get("unit")),
+                "price": value(item.get("price")),
+                "amount": value(item.get("amount")),
+            }
+            for item in explainable.get("items", [])
+        ],
+        "raw_text": explainable.get("raw_text", ""),
+        "warnings": list(explainable.get("warnings", [])),
+        "meta": dict(explainable.get("meta", {})),
+    }
 
 
 def extract_text_from_vision_response(vision_response: Dict[str, Any] | str | None) -> str:
-    """Извлекает OCR-текст с приоритетом fullText -> line.text -> words.
-
-    Это важно: если собрать вообще все ключи "text", появятся дубли
-    fullText + строки + слова. Поэтому используются уровни приоритета.
-    """
     if vision_response is None:
         return ""
 
@@ -194,48 +225,69 @@ def extract_text_from_vision_response(vision_response: Dict[str, Any] | str | No
     if not isinstance(vision_response, dict):
         return ""
 
-    full_texts = _collect_values_by_keys(vision_response, {"fullText", "full_text", "fullTextAnnotation"})
-    full_texts = [t for t in full_texts if _looks_like_text(t)]
+    if isinstance(vision_response.get("result"), dict):
+        inner_text = extract_text_from_vision_response(vision_response["result"])
+        if inner_text:
+            return inner_text
+
+    full_texts = _collect_values_by_keys(
+        vision_response,
+        {"fullText", "full_text", "fullTextAnnotation", "full_text_annotation"},
+    )
+    full_texts = [extract_text_value(value) for value in full_texts]
+    full_texts = [value for value in full_texts if _looks_like_text(value)]
 
     if full_texts:
-        # Берём самый длинный fullText: обычно это самый полный OCR.
         return normalize_text(max(full_texts, key=len))
 
     line_texts = _collect_line_texts(vision_response)
+
     if line_texts:
         return normalize_text("\n".join(_unique_preserve_order(line_texts)))
 
+    generic_texts = _collect_values_by_keys(vision_response, {"text"})
+    generic_texts = [extract_text_value(value) for value in generic_texts]
+    generic_texts = [value for value in generic_texts if _looks_like_text(value)]
+
+    if generic_texts:
+        return normalize_text("\n".join(_unique_preserve_order(generic_texts)))
+
     word_texts = _collect_word_texts(vision_response)
+
     if word_texts:
         return normalize_text(" ".join(word_texts))
 
-    generic_texts = _collect_values_by_keys(vision_response, {"text"})
-    generic_texts = [t for t in generic_texts if _looks_like_text(t)]
-    return normalize_text("\n".join(_unique_preserve_order(generic_texts)))
+    return ""
+
+
+def extract_text_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+
+    if isinstance(value, dict):
+        for key in ("text", "fullText", "full_text"):
+            if isinstance(value.get(key), str):
+                return value[key]
+
+    return ""
 
 
 def extract_table_rows_from_vision_response(vision_response: Dict[str, Any] | str | None) -> List[List[str]]:
-    """Пытается извлечь строки таблиц из произвольного JSON ответа.
-
-    Поддерживает частые структуры:
-    - {"tables": [{"rows": [{"cells": [{"text": "..."}]}]}]}
-    - {"cells": [{"rowIndex": 0, "columnIndex": 1, "text": "..."}]}
-    - snake_case варианты row_index/column_index.
+    """
+    Достаёт таблицы из JSON вида:
+    {"tables": [{"cells": [{"rowIndex": 0, "columnIndex": 0, "text": "..."}]}]}.
     """
     if not isinstance(vision_response, dict):
         return []
 
-    rows: List[List[str]] = []
+    tables = []
 
     def walk(obj: Any) -> None:
         if isinstance(obj, dict):
-            if isinstance(obj.get("rows"), list):
-                parsed = _parse_rows_structure(obj.get("rows"))
-                rows.extend(parsed)
+            maybe_tables = obj.get("tables")
 
-            if isinstance(obj.get("cells"), list):
-                parsed = _parse_cells_structure(obj.get("cells"))
-                rows.extend(parsed)
+            if isinstance(maybe_tables, list):
+                tables.extend(table for table in maybe_tables if isinstance(table, dict))
 
             for value in obj.values():
                 if isinstance(value, (dict, list)):
@@ -246,90 +298,1078 @@ def extract_table_rows_from_vision_response(vision_response: Dict[str, Any] | st
                 walk(item)
 
     walk(vision_response)
-    return [row for row in rows if any(cell.strip() for cell in row)]
+
+    all_rows: List[List[str]] = []
+
+    for table in tables:
+        cells = table.get("cells")
+
+        if not isinstance(cells, list):
+            continue
+
+        grid: Dict[int, Dict[int, str]] = {}
+
+        for cell in cells:
+            if not isinstance(cell, dict):
+                continue
+
+            row_index = cell.get("rowIndex", cell.get("row_index", cell.get("row")))
+            col_index = cell.get("columnIndex", cell.get("column_index", cell.get("column")))
+
+            try:
+                row_index = int(row_index)
+                col_index = int(col_index)
+            except (TypeError, ValueError):
+                continue
+
+            text = extract_text_value(cell.get("text", cell))
+            text = normalize_single_line(text)
+
+            grid.setdefault(row_index, {})[col_index] = text
+
+        for row_index in sorted(grid):
+            row_map = grid[row_index]
+            max_col = max(row_map) if row_map else -1
+            row = [row_map.get(col, "") for col in range(max_col + 1)]
+            all_rows.append(row)
+
+    return all_rows
 
 
-def _collect_values_by_keys(obj: Any, keys: set[str]) -> List[str]:
-    values: List[str] = []
+def parse_text(raw_text: str, table_rows: Optional[List[List[str]]] = None) -> Dict[str, Any]:
+    text = normalize_text(raw_text)
+    flat = normalize_single_line(text)
+
+    document = {
+        "type": find_document_type(flat),
+        "number": find_document_number(flat),
+        "date": find_document_date(flat),
+        "total_amount": find_total_amount(flat),
+    }
+
+    counterparties = find_counterparties(flat)
+
+    items = []
+
+    if table_rows:
+        items.extend(find_items_from_table_rows(table_rows))
+
+    items.extend(find_items(text))
+    items = deduplicate_items(items)
+
+    warnings = build_warnings(document, counterparties, items)
+
+    return {
+        "document": document,
+        "counterparties": counterparties,
+        "items": items,
+        "raw_text": format_raw_text(text),
+        "warnings": warnings,
+    }
+
+
+def normalize_text(text: str) -> str:
+    text = text or ""
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u202f", " ")
+    text = text.replace("\\n", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    lines = []
+
+    for line in text.split("\n"):
+        cleaned = re.sub(r"[ \t]+", " ", line).strip()
+
+        if cleaned:
+            lines.append(cleaned)
+
+    return "\n".join(lines)
+
+
+def normalize_single_line(text: str) -> str:
+    text = normalize_text(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def format_raw_text(text: str, max_lines: int = 120) -> Dict[str, Any]:
+    text = normalize_text(text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    preview = re.sub(r"\s+", " ", " ".join(lines)).strip()
+
+    return {
+        "preview": preview[:1500],
+        "lines": lines[:max_lines],
+        "line_count": len(lines),
+        "truncated": len(lines) > max_lines,
+    }
+
+
+def find_document_type(flat: str) -> Optional[str]:
+    search = flat.lower()
+
+    patterns = [
+        ("Счет-фактура", r"\bсч[её]т[\s-]*фактура\b"),
+        ("УПД", r"\b(упд|универсальный передаточный документ)\b"),
+        ("Накладная", r"\b(накладная|товарная накладная|торг-?12)\b"),
+        ("Акт", r"\bакт\b"),
+        ("Договор", r"\b(договор|contract|agreement)\b"),
+        ("Счёт", r"\b(сч[её]т|счет на оплату)\b"),
+        ("Invoice", r"\b(invoice|commercial invoice|tax invoice)\b"),
+    ]
+
+    for label, pattern in patterns:
+        if re.search(pattern, search, flags=re.IGNORECASE):
+            return label
+
+    return None
+
+
+def find_document_number(flat: str) -> Optional[str]:
+    search_area = flat[:1500]
+
+    patterns = [
+        r"(?:invoice\s*(?:number|no\.?|#)\s*[:\-]?\s*)([A-Za-z0-9_.\-\/\\]+)",
+        r"(?:document\s*(?:number|no\.?|#)\s*[:\-]?\s*)([A-Za-z0-9_.\-\/\\]+)",
+        r"(?:номер\s*(?:документа)?\s*[:\-]?\s*)([A-Za-zА-Яа-я0-9_.\-\/\\]+)",
+        r"(?:№|n[oо]?\.?)\s*([A-Za-zА-Яа-я0-9_.\-\/\\]+)",
+        r"(?:сч[её]т|invoice|акт|накладная|договор|упд).{0,100}?(?:№|n[oо]?\.?|number|#)\s*[:\-]?\s*([A-Za-zА-Яа-я0-9_.\-\/\\]+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, search_area, flags=re.IGNORECASE)
+
+        if not match:
+            continue
+
+        number = clean_document_number(match.group(1))
+
+        if not number:
+            continue
+
+        if re.fullmatch(r"\d{10,12}", number):
+            continue
+
+        if re.fullmatch(r"\d{1,2}[./-]\d{1,2}[./-]\d{2,4}", number):
+            continue
+
+        if len(number) > 50:
+            continue
+
+        return number
+
+    return None
+
+
+def clean_document_number(value: str) -> Optional[str]:
+    if not value:
+        return None
+
+    value = value.strip().replace("\\", "/")
+    value = value.strip(".,;:()[]{}<>")
+    value = re.sub(r"\s*(?:от|date|dated)$", "", value, flags=re.IGNORECASE).strip()
+
+    return value or None
+
+
+def find_document_date(flat: str) -> Optional[str]:
+    search_area = flat[:1800]
+
+    month_pattern = (
+        r"[«\"]?(\d{1,2})[»\"]?\s*"
+        r"(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)"
+        r"\s*(\d{4})"
+    )
+
+    match = re.search(month_pattern, search_area, flags=re.IGNORECASE)
+
+    if match:
+        return normalize_date_from_parts(match.group(1), month_to_number(match.group(2)), match.group(3))
+
+    patterns = [
+        r"(?:invoice\s*date|document\s*date|date|дата|от)\s*[:\-]?\s*(\d{4}[./-]\d{1,2}[./-]\d{1,2})",
+        r"(?:invoice\s*date|document\s*date|date|дата|от)\s*[:\-]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})",
+        r"\b(\d{4}[./-]\d{1,2}[./-]\d{1,2})\b",
+        r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, search_area, flags=re.IGNORECASE)
+
+        if match:
+            return normalize_date(match.group(1))
+
+    return None
+
+
+def month_to_number(month_name: str) -> str:
+    months = {
+        "января": "01",
+        "февраля": "02",
+        "марта": "03",
+        "апреля": "04",
+        "мая": "05",
+        "июня": "06",
+        "июля": "07",
+        "августа": "08",
+        "сентября": "09",
+        "октября": "10",
+        "ноября": "11",
+        "декабря": "12",
+    }
+
+    return months.get(month_name.lower(), "01")
+
+
+def normalize_date_from_parts(day: str, month: str, year: str) -> str:
+    return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+
+
+def normalize_date(value: str) -> str:
+    value = value.strip().replace("/", ".").replace("-", ".")
+    parts = value.split(".")
+
+    if len(parts) != 3:
+        return value
+
+    if len(parts[0]) == 4:
+        year = parts[0]
+        month = parts[1].zfill(2)
+        day = parts[2].zfill(2)
+    else:
+        day = parts[0].zfill(2)
+        month = parts[1].zfill(2)
+        year = parts[2]
+
+        if len(year) == 2:
+            year = "20" + year
+
+    return f"{year}-{month}-{day}"
+
+
+def find_total_amount(flat: str) -> Optional[float]:
+    rub_kop_patterns = [
+        r"(?:итого|всего|сумма|к оплате).{0,80}?([0-9][0-9\s\u00a0\u202f]*)\s*руб\.?\s*(\d{1,2})\s*коп",
+        r"(?:итого|всего|сумма|к оплате).{0,80}?([0-9][0-9\s\u00a0\u202f]*)-(\d{1,2})\b",
+    ]
+
+    for pattern in rub_kop_patterns:
+        match = re.search(pattern, flat, flags=re.IGNORECASE)
+
+        if match:
+            whole = re.sub(r"\s+", "", match.group(1))
+            cents = match.group(2).zfill(2)
+            return parse_amount(f"{whole}.{cents}")
+
+    priority_patterns = [
+        r"(?:grand\s*total|total\s*amount|total\s*due|amount\s*due|invoice\s*total)\s*[:\-]?\s*(?:USD|EUR|RUB|₽|\$)?\s*([0-9][0-9\s\u00a0\u202f,.]*[,.]\d{2}|[0-9]+)",
+        r"(?:итого\s*к\s*оплате|всего\s*к\s*оплате|сумма\s*к\s*оплате|на\s*сумму)\s*[:\-]?\s*([0-9][0-9\s\u00a0\u202f,.]*[,.]\d{2}|[0-9]+)",
+        r"(?:итого\s*с\s*ндс|итого\s*без\s*ндс|всего\s*без\s*ндс|итого|всего|сумма)\s*[:\-]?\s*([0-9][0-9\s\u00a0\u202f,.]*[,.]\d{2}|[0-9]+)",
+        r"(?:total|subtotal)\s*[:\-]?\s*(?:USD|EUR|RUB|₽|\$)?\s*([0-9][0-9\s\u00a0\u202f,.]*[,.]\d{2}|[0-9]+)",
+    ]
+
+    candidates = []
+
+    for pattern in priority_patterns:
+        for match in re.finditer(pattern, flat, flags=re.IGNORECASE):
+            amount = parse_amount(match.group(1))
+
+            if amount is not None:
+                candidates.append(amount)
+
+    if candidates:
+        return max(candidates)
+
+    cleaned = remove_dates_and_ids_for_amount_fallback(flat)
+    numbers = re.findall(r"\b([0-9]+(?:[,.]\d{1,2})?)\b", cleaned)
+
+    values = [parse_amount(value) for value in numbers]
+    values = [value for value in values if value is not None and value > 0]
+
+    if values:
+        return max(values)
+
+    return None
+
+
+def remove_dates_and_ids_for_amount_fallback(flat: str) -> str:
+    text = re.sub(r"\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b", " ", flat)
+    text = re.sub(r"\b\d{4}[./-]\d{1,2}[./-]\d{1,2}\b", " ", text)
+    text = re.sub(r"\b\d{9,12}\b", " ", text)
+
+    return text
+
+
+def parse_amount(value: str) -> Optional[float]:
+    if value is None:
+        return None
+
+    value = str(value)
+    value = value.replace("\u00a0", " ").replace("\u202f", " ")
+    value = re.sub(r"(USD|EUR|RUB|руб\.?|рублей|рубля|р\.|₽|\$)", "", value, flags=re.IGNORECASE)
+    value = value.strip()
+    value = re.sub(r"(?<=\d)-(?=\d{1,2}\b)", ".", value)
+
+    if "," in value and "." in value:
+        if value.rfind(",") > value.rfind("."):
+            value = value.replace(".", "").replace(",", ".")
+        else:
+            value = value.replace(",", "")
+
+    elif "," in value and "." not in value:
+        if re.search(r",\d{1,2}$", value):
+            value = value.replace(",", ".")
+        else:
+            value = value.replace(",", "")
+
+    elif "." in value and "," not in value:
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})+", value):
+            value = value.replace(".", "")
+
+    value = value.replace(" ", "")
+    value = re.sub(r"[^0-9.\-]", "", value)
+
+    if not value or value in ("-", ".", "-."):
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def find_counterparties(flat: str) -> List[Dict[str, Any]]:
+    role_specs = [
+        ("seller", ["Поставщик", "Продавец", "Supplier", "Vendor", "Seller", "Provider"]),
+        ("buyer", ["Покупатель", "Buyer", "Customer", "Client", "Bill To"]),
+        ("executor", ["Исполнитель", "Contractor", "Executor"]),
+        ("customer", ["Заказчик", "Customer"]),
+    ]
+
+    stop_labels = [
+        "Поставщик",
+        "Продавец",
+        "Покупатель",
+        "Исполнитель",
+        "Заказчик",
+        "Supplier",
+        "Vendor",
+        "Seller",
+        "Buyer",
+        "Customer",
+        "Client",
+        "Bill To",
+        "Ship To",
+        "Items",
+        "Table",
+        "Основание",
+        "Назначение",
+        "Итого",
+        "Всего",
+        "Total",
+        "Subtotal",
+    ]
+
+    parties = []
+
+    for role, labels in role_specs:
+        section = find_role_section(flat, labels=labels, stop_labels=stop_labels)
+
+        if not section:
+            continue
+
+        name = clean_org_name(extract_name_from_section(section))
+        inn = find_inn_in_section(section)
+        kpp = find_kpp_in_section(section)
+
+        if name or inn or kpp:
+            parties.append(
+                {
+                    "role": role,
+                    "name": name,
+                    "inn": inn,
+                    "kpp": kpp,
+                }
+            )
+
+    if parties:
+        return fill_missing_party_ids(deduplicate_counterparties(parties), flat)
+
+    org_entries = find_org_entries(flat)
+
+    if org_entries:
+        roles = ["seller", "buyer"]
+        result = []
+
+        for index, entry in enumerate(org_entries[:2]):
+            result.append(
+                {
+                    "role": roles[index] if index < len(roles) else "unknown",
+                    "name": entry.get("name"),
+                    "inn": entry.get("inn"),
+                    "kpp": entry.get("kpp"),
+                }
+            )
+
+        return result
+
+    all_inns = find_all_inn(flat)
+    all_kpps = find_all_kpp(flat)
+
+    result = []
+
+    if all_inns or all_kpps:
+        roles = ["seller", "buyer"]
+        count = max(len(all_inns), len(all_kpps), 1)
+
+        for index in range(min(count, 2)):
+            result.append(
+                {
+                    "role": roles[index] if index < len(roles) else "unknown",
+                    "name": None,
+                    "inn": all_inns[index] if index < len(all_inns) else None,
+                    "kpp": all_kpps[index] if index < len(all_kpps) else None,
+                }
+            )
+
+    if not result:
+        result.append(
+            {
+                "role": "unknown",
+                "name": None,
+                "inn": None,
+                "kpp": None,
+            }
+        )
+
+    return result
+
+
+def find_role_section(flat: str, labels: List[str], stop_labels: List[str], max_len: int = 600) -> str:
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    stop_pattern = "|".join(re.escape(label) for label in stop_labels if label not in labels)
+
+    match = re.search(rf"\b(?:{label_pattern})\b\s*[:\-]?\s*", flat, flags=re.IGNORECASE)
+
+    if not match:
+        return ""
+
+    start = match.end()
+    end = min(len(flat), start + max_len)
+
+    stop_match = re.search(rf"\b(?:{stop_pattern})\b\s*[:\-]?", flat[start:end], flags=re.IGNORECASE)
+
+    if stop_match:
+        end = start + stop_match.start()
+
+    return flat[start:end].strip()
+
+
+def extract_name_from_section(section: str) -> Optional[str]:
+    if not section:
+        return None
+
+    section = section.strip()
+
+    cut_patterns = [
+        r"\bИНН\b",
+        r"\bКПП\b",
+        r"\bINN\b",
+        r"\bKPP\b",
+        r"\bTax\s*ID\b",
+        r"\bAddress\b",
+        r"\bАдрес\b",
+        r"\bпоставщика\b",
+        r"\bпокупателя\b",
+        r"\bSupplier\s*INN\b",
+        r"\bBuyer\s*INN\b",
+        r"\bCustomer\s*INN\b",
+        r"\d{9,12}",
+    ]
+
+    cut_at = len(section)
+
+    for pattern in cut_patterns:
+        match = re.search(pattern, section, flags=re.IGNORECASE)
+
+        if match:
+            cut_at = min(cut_at, match.start())
+
+    name = section[:cut_at].strip(" :-,;")
+
+    if not name:
+        org_match = re.search(
+            r"((?:ООО|АО|ПАО|ЗАО|ОАО|ИП|LLC|Ltd\.?|Limited|Inc\.?|Corp\.?|Company)\s+[^,;:]{2,120})",
+            section,
+            flags=re.IGNORECASE,
+        )
+
+        if org_match:
+            name = org_match.group(1)
+
+    return name or None
+
+
+def clean_org_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+
+    name = str(name)
+    name = name.replace('\\"', '"').replace("\\'", "'")
+    name = name.replace("«", "").replace("»", "")
+    name = name.replace('"', "").replace("'", "").replace("`", "")
+
+    name = re.sub(
+        r"\b(?:поставщика|покупателя|supplier|buyer|customer|vendor|seller|provider)\s*[:\-]?",
+        "",
+        name,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(r"\b(?:ИНН|КПП|INN|KPP|Tax\s*ID|Address|Адрес)\b.*$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"\d{6,}.*$", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.strip(" ,;:-")
+
+    return name or None
+
+
+def find_org_entries(flat: str) -> List[Dict[str, Any]]:
+    entries = []
+
+    pattern = re.compile(
+        r"((?:ООО|АО|ПАО|ЗАО|ОАО|ИП|LLC|Ltd\.?|Limited|Inc\.?|Corp\.?|Company)\s+.{2,80}?)"
+        r"\s+(?:ИНН|INN|Tax\s*ID)\s*[:\-]?\s*((?:\d[\s]*){10,12})"
+        r"(?:\s+(?:КПП|KPP)\s*[:\-]?\s*((?:\d[\s]*){9}))?",
+        flags=re.IGNORECASE,
+    )
+
+    for match in pattern.finditer(flat):
+        entries.append(
+            {
+                "name": clean_org_name(match.group(1)),
+                "inn": normalize_digits(match.group(2)),
+                "kpp": normalize_digits(match.group(3)) if match.group(3) else None,
+            }
+        )
+
+    return entries
+
+
+def fill_missing_party_ids(parties: List[Dict[str, Any]], flat: str) -> List[Dict[str, Any]]:
+    """
+    Дозаполняет ИНН/КПП только там, где это безопасно.
+
+    Важно:
+    - ИП / физлица с 12-значным ИНН обычно не имеют КПП;
+    - нельзя брать первый найденный КПП из всего документа и лепить его первому контрагенту;
+    - особенно нельзя присваивать КПП исполнителю, если это ИП.
+    """
+    all_inns = find_all_inn(flat)
+    all_kpps = find_all_kpp(flat)
+
+    used_inns = {party.get("inn") for party in parties if party.get("inn")}
+    used_kpps = {party.get("kpp") for party in parties if party.get("kpp")}
+
+    free_inns = [inn for inn in all_inns if inn not in used_inns]
+    free_kpps = [kpp for kpp in all_kpps if kpp not in used_kpps]
+
+    for party in parties:
+        role = party.get("role")
+        inn = party.get("inn")
+        kpp = party.get("kpp")
+
+        # Если у стороны уже есть ИНН и КПП, ничего не трогаем.
+        if inn and kpp:
+            continue
+
+        # 12-значный ИНН обычно означает ИП/физлицо.
+        # Для него КПП не подставляем из общего списка.
+        is_individual_or_ip = bool(inn and len(str(inn)) == 12)
+
+        if not inn and free_inns:
+            party["inn"] = free_inns.pop(0)
+            inn = party["inn"]
+            is_individual_or_ip = bool(inn and len(str(inn)) == 12)
+
+        if kpp:
+            continue
+
+        # Исполнителю с 12-значным ИНН КПП не нужен.
+        if role == "executor" and is_individual_or_ip:
+            party["kpp"] = None
+            continue
+
+        # Любой стороне с 12-значным ИНН КПП не навязываем.
+        if is_individual_or_ip:
+            party["kpp"] = None
+            continue
+
+        # КПП дозаполняем только юрлицам и только если есть свободный КПП.
+        if free_kpps:
+            party["kpp"] = free_kpps.pop(0)
+
+    return parties
+
+
+def find_all_inn(flat: str) -> List[str]:
+    values = []
+
+    pattern = r"\b(?:ИНН|INN|Tax\s*ID)\b[^\d]{0,40}((?:\d[\s]*){10,12})\b"
+
+    for match in re.finditer(pattern, flat, flags=re.IGNORECASE):
+        values.append(normalize_digits(match.group(1)))
+
+    for match in re.finditer(r"\b((?:\d[\s]*){10,12})\b", flat):
+        normalized = normalize_digits(match.group(1))
+
+        if len(normalized) in (10, 12):
+            values.append(normalized)
+
+    return _unique_preserve_order(values)
+
+
+def find_all_kpp(flat: str) -> List[str]:
+    values = []
+
+    pattern = r"\b(?:КПП|KPP)\b[^\d]{0,40}((?:\d[\s]*){9})\b"
+
+    for match in re.finditer(pattern, flat, flags=re.IGNORECASE):
+        values.append(normalize_digits(match.group(1)))
+
+    for match in re.finditer(r"\b((?:\d[\s]*){9})\b", flat):
+        normalized = normalize_digits(match.group(1))
+
+        if len(normalized) == 9:
+            values.append(normalized)
+
+    return _unique_preserve_order(values)
+
+
+def find_inn_in_section(section: str) -> Optional[str]:
+    if not section:
+        return None
+
+    match = re.search(r"\b(?:ИНН|INN|Tax\s*ID)\b[^\d]{0,40}((?:\d[\s]*){10,12})\b", section, flags=re.IGNORECASE)
+
+    if match:
+        return normalize_digits(match.group(1))
+
+    match = re.search(r"\b((?:\d[\s]*){10,12})\b", section)
+
+    return normalize_digits(match.group(1)) if match else None
+
+
+def find_kpp_in_section(section: str) -> Optional[str]:
+    if not section:
+        return None
+
+    match = re.search(r"\b(?:КПП|KPP)\b[^\d]{0,40}((?:\d[\s]*){9})\b", section, flags=re.IGNORECASE)
+
+    if match:
+        return normalize_digits(match.group(1))
+
+    match = re.search(r"\b((?:\d[\s]*){9})\b", section)
+
+    return normalize_digits(match.group(1)) if match else None
+
+
+def normalize_digits(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+
+    digits = re.sub(r"\D", "", str(value))
+
+    return digits or None
+
+
+def deduplicate_counterparties(counterparties: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result = []
+    seen = set()
+
+    for party in counterparties:
+        key = (party.get("role"), party.get("inn"), party.get("kpp"), party.get("name"))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(party)
+
+    return result
+
+
+def find_items_from_table_rows(rows: List[List[str]]) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+
+    header_index = None
+    header = []
+
+    for index, row in enumerate(rows):
+        joined = normalize_single_line(" ".join(row)).lower()
+
+        if any(word in joined for word in ("наименование", "description", "item", "service")) and any(
+            word in joined for word in ("сумма", "amount", "total")
+        ):
+            header_index = index
+            header = [normalize_single_line(cell).lower() for cell in row]
+            break
+
+    if header_index is None:
+        return []
+
+    def find_col(*names: str) -> Optional[int]:
+        for i, cell in enumerate(header):
+            if any(name in cell for name in names):
+                return i
+        return None
+
+    name_col = find_col("наименование", "description", "item", "service")
+    qty_col = find_col("кол", "quantity", "qty")
+    unit_col = find_col("ед", "unit")
+    price_col = find_col("цена", "price")
+    amount_col = find_col("сумма", "amount", "total")
+
+    items = []
+
+    for row in rows[header_index + 1:]:
+        if not row or not any(cell.strip() for cell in row):
+            continue
+
+        name = clean_item_name(row[name_col]) if name_col is not None and name_col < len(row) else None
+
+        if not name:
+            continue
+
+        if re.search(r"\b(?:итого|всего|total|subtotal)\b", name, flags=re.IGNORECASE):
+            continue
+
+        item = {
+            "position": len(items) + 1,
+            "name": name,
+            "quantity": parse_quantity(row[qty_col]) if qty_col is not None and qty_col < len(row) else None,
+            "unit": row[unit_col].strip() if unit_col is not None and unit_col < len(row) and row[unit_col].strip() else None,
+            "price": parse_amount(row[price_col]) if price_col is not None and price_col < len(row) else None,
+            "amount": parse_amount(row[amount_col]) if amount_col is not None and amount_col < len(row) else None,
+        }
+
+        items.append(item)
+
+    return items
+
+
+def find_items(text: str) -> List[Dict[str, Any]]:
+    lines = [line.strip() for line in normalize_text(text).splitlines() if line.strip()]
+    items = []
+    buffer = ""
+
+    for line in lines:
+        if is_total_line(line):
+            continue
+
+        if buffer:
+            merged = f"{buffer} {line}"
+            item = parse_item_line(merged)
+
+            if item:
+                items.append(item)
+                buffer = ""
+                continue
+
+        item = parse_item_line(line)
+
+        if item:
+            items.append(item)
+            buffer = ""
+            continue
+
+        item = parse_item_without_row_number(line)
+
+        if item:
+            items.append(item)
+            buffer = ""
+            continue
+
+        if re.match(r"^\s*\d+[.)]?\s+", line):
+            buffer = line
+
+    if items:
+        return items
+
+    flat = normalize_single_line(text)
+    item = parse_item_without_row_number(flat)
+
+    return [item] if item else []
+
+
+def parse_item_line(line: str) -> Optional[Dict[str, Any]]:
+    line = normalize_single_line(line)
+
+    if not line or is_total_line(line):
+        return None
+
+    pattern_with_unit = re.compile(
+        r"^\s*(\d+)[.)]?\s+"
+        r"(.{3,140}?)\s+"
+        r"(?:(\d+(?:[,.]\d+)?)\s+)?"
+        r"(шт|усл|ед|pcs|piece|pieces|service|services|hour|hours)\.?\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    match = pattern_with_unit.search(line)
+
+    if match:
+        name = clean_item_name(match.group(2))
+
+        if not name:
+            return None
+
+        return {
+            "position": int(match.group(1)),
+            "name": name,
+            "quantity": parse_quantity(match.group(3)) if match.group(3) else None,
+            "unit": match.group(4).strip().strip("."),
+            "price": parse_amount(match.group(5)),
+            "amount": parse_amount(match.group(6)),
+        }
+
+    pattern_no_unit = re.compile(
+        r"^\s*(\d+)[.)]?\s+"
+        r"(.{3,160}?)\s+"
+        r"(\d+(?:[,.]\d+)?)\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s*$",
+        flags=re.IGNORECASE,
+    )
+
+    match = pattern_no_unit.search(line)
+
+    if match:
+        name = clean_item_name(match.group(2))
+
+        if not name:
+            return None
+
+        return {
+            "position": int(match.group(1)),
+            "name": name,
+            "quantity": parse_quantity(match.group(3)),
+            "unit": None,
+            "price": parse_amount(match.group(4)),
+            "amount": parse_amount(match.group(5)),
+        }
+
+    return None
+
+
+def parse_item_without_row_number(line: str) -> Optional[Dict[str, Any]]:
+    if is_total_line(line):
+        return None
+
+    line = normalize_single_line(line)
+
+    match = re.search(
+        r"(.{3,120}?)\s+"
+        r"(\d+(?:[,.]\d+)?)\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s+"
+        r"([0-9][0-9\s\u00a0\u202f,.]*(?:[,.]\d{2})|[0-9]+)\s*$",
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    name = clean_item_name(match.group(1))
+
+    if not name:
+        return None
+
+    return {
+        "position": 1,
+        "name": name,
+        "quantity": parse_quantity(match.group(2)),
+        "unit": None,
+        "price": parse_amount(match.group(3)),
+        "amount": parse_amount(match.group(4)),
+    }
+
+
+def is_total_line(line: str) -> bool:
+    return bool(re.search(r"\b(?:итого|всего|ндс|total|subtotal|amount due|grand total)\b", line, flags=re.IGNORECASE))
+
+
+def clean_item_name(name: str) -> Optional[str]:
+    if not name:
+        return None
+
+    name = re.sub(r"\s+", " ", name).strip()
+    name = name.strip(" ,;:-")
+
+    if len(name) < 2:
+        return None
+
+    return name
+
+
+def parse_quantity(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+
+    value = str(value).replace(",", ".")
+    value = re.sub(r"[^0-9.\-]", "", value)
+
+    if not value:
+        return None
+
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def deduplicate_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result = []
+    seen = set()
+
+    for item in items:
+        key = (item.get("name"), item.get("quantity"), item.get("price"), item.get("amount"))
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(item)
+
+    return result
+
+
+def build_warnings(
+    document: Dict[str, Any],
+    counterparties: List[Dict[str, Any]],
+    items: List[Dict[str, Any]],
+) -> List[str]:
+    warnings = []
+
+    if not document.get("type"):
+        warnings.append("Не удалось определить тип документа")
+
+    if not document.get("number"):
+        warnings.append("Не удалось определить номер документа")
+
+    if not document.get("date"):
+        warnings.append("Не удалось определить дату документа")
+
+    if document.get("total_amount") is None:
+        warnings.append("Не удалось определить итоговую сумму")
+
+    if not counterparties or not any(party.get("inn") for party in counterparties):
+        warnings.append("Не удалось определить ИНН контрагента")
+
+    if not counterparties or not any(party.get("kpp") for party in counterparties):
+        warnings.append("Не удалось определить КПП контрагента")
+
+    if not items:
+        warnings.append("Не удалось распознать табличные позиции")
+
+    return warnings
+
+
+def _collect_values_by_keys(obj: Any, keys: set) -> List[Any]:
+    values = []
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
             for key, nested in value.items():
-                if key in keys and isinstance(nested, str):
+                if key in keys:
                     values.append(nested)
-                elif key in keys and isinstance(nested, dict):
-                    text = nested.get("text")
-                    if isinstance(text, str):
-                        values.append(text)
+
                 if isinstance(nested, (dict, list)):
                     walk(nested)
+
         elif isinstance(value, list):
             for item in value:
                 walk(item)
 
     walk(obj)
+
     return values
 
 
 def _collect_line_texts(obj: Any) -> List[str]:
-    lines: List[str] = []
+    lines = []
 
-    def text_from_line(line: Any) -> Optional[str]:
+    def line_to_text(line: Any) -> Optional[str]:
         if isinstance(line, str):
             return line
+
         if isinstance(line, dict):
             if isinstance(line.get("text"), str):
                 return line["text"]
+
             if isinstance(line.get("words"), list):
                 words = []
+
                 for word in line["words"]:
                     if isinstance(word, dict) and isinstance(word.get("text"), str):
                         words.append(word["text"])
                     elif isinstance(word, str):
                         words.append(word)
+
                 if words:
                     return " ".join(words)
+
         return None
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
             maybe_lines = value.get("lines")
+
             if isinstance(maybe_lines, list):
                 for line in maybe_lines:
-                    text = text_from_line(line)
+                    text = line_to_text(line)
+
                     if text:
                         lines.append(text)
+
             for nested in value.values():
                 if isinstance(nested, (dict, list)):
                     walk(nested)
+
         elif isinstance(value, list):
             for item in value:
                 walk(item)
 
     walk(obj)
+
     return [normalize_single_line(line) for line in lines if normalize_single_line(line)]
 
 
 def _collect_word_texts(obj: Any) -> List[str]:
-    words: List[str] = []
+    words = []
 
     def walk(value: Any) -> None:
         if isinstance(value, dict):
             maybe_words = value.get("words")
+
             if isinstance(maybe_words, list):
                 for word in maybe_words:
                     if isinstance(word, dict) and isinstance(word.get("text"), str):
                         words.append(word["text"])
                     elif isinstance(word, str):
                         words.append(word)
+
             for nested in value.values():
                 if isinstance(nested, (dict, list)):
                     walk(nested)
+
         elif isinstance(value, list):
             for item in value:
                 walk(item)
 
     walk(obj)
+
     return [normalize_single_line(word) for word in words if normalize_single_line(word)]
 
 
@@ -339,521 +1379,3 @@ def _looks_like_text(value: str) -> bool:
 
 def _unique_preserve_order(items: Iterable[str]) -> List[str]:
     return list(dict.fromkeys(item for item in items if item))
-
-
-def _find_document_type(text: str) -> FieldValue:
-    search = normalize_for_search(text)
-    for label, pattern, confidence in DOC_TYPE_PATTERNS:
-        if re.search(pattern, search, flags=re.IGNORECASE):
-            return field(label, confidence, f"regex:{pattern}")
-    return field(None, 0.0, "not_found")
-
-
-def _find_document_number(text: str) -> FieldValue:
-    search_area = text[:600]  # номер почти всегда в шапке
-    candidates: List[Tuple[str, float, str, int]] = []
-
-    for pattern, confidence in NUMBER_PATTERNS:
-        for match in re.finditer(pattern, search_area, flags=re.IGNORECASE):
-            raw = match.group(1)
-            number = normalize_document_number(raw)
-            if not number:
-                continue
-
-            # Отсекаем ИНН/КПП, даты и слишком длинные фрагменты.
-            if normalize_inn(number) or normalize_kpp(number) or normalize_date(number):
-                continue
-            if len(number) > 40:
-                continue
-
-            candidates.append((number, confidence, f"regex:{pattern}", match.start()))
-
-    if candidates:
-        # Предпочитаем более ранний и более уверенный номер.
-        candidates.sort(key=lambda x: (-x[1], x[3]))
-        number, confidence, source, _ = candidates[0]
-        return field(number, confidence, source)
-
-    return field(None, 0.0, "not_found")
-
-
-def _find_document_date(text: str) -> FieldValue:
-    search_area = text[:1000]
-    for pattern, confidence in DATE_PATTERNS:
-        for match in re.finditer(pattern, search_area, flags=re.IGNORECASE):
-            normalized = normalize_date(match.group(1))
-            if normalized:
-                return field(normalized, confidence, f"regex:{pattern}")
-    return field(None, 0.0, "not_found")
-
-
-def _find_total_amount(text: str) -> FieldValue:
-    candidates: List[Tuple[float, float, str, int]] = []
-
-    for pattern, confidence in AMOUNT_PATTERNS:
-        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-            raw = match.group(1)
-            amount = normalize_amount(raw)
-            if amount is not None:
-                candidates.append((amount, confidence, f"regex:{pattern}", match.start()))
-
-    if candidates:
-        # Приоритет: confidence, потом более поздняя строка, потом сумма.
-        amount, confidence, source, _ = max(candidates, key=lambda x: (x[1], x[3], x[0]))
-        return field(amount, confidence, source)
-
-    # Fallback: выбираем максимальное простое число из документа, если ключи не найдены.
-    # Здесь специально не считаем "100 200 300" одной суммой.
-    money_values: List[float] = []
-    fallback_number_pattern = re.compile(r"(?<![\w./-])-?\d+(?:[,.]\d{1,2})?(?![\w./-])")
-    for match in fallback_number_pattern.finditer(text):
-        value = normalize_amount(match.group(0))
-        if value is not None and value > 0:
-            money_values.append(value)
-
-    if money_values:
-        return field(max(money_values), 0.45, "fallback:max_money_like_number")
-
-    return field(None, 0.0, "not_found")
-
-
-def _find_counterparties(text: str) -> List[Counterparty]:
-    parties: List[Counterparty] = []
-    parties.extend(_find_counterparties_by_role_sections(text))
-
-    if len(parties) < 2:
-        parties.extend(_find_counterparties_by_inn_fallback(text, existing=parties))
-
-    return _deduplicate_parties(parties)
-
-
-def _find_counterparties_by_role_sections(text: str) -> List[Counterparty]:
-    flat = normalize_single_line(text)
-    parties: List[Counterparty] = []
-
-    section_pattern = re.compile(
-        rf"\b(?P<label>{ROLE_WORDS})\b\s*[:\-]?\s*"
-        rf"(?P<body>.{{0,350}}?)"
-        rf"(?=(?:\b(?:{ROLE_WORDS})\b\s*[:\-])|$)",
-        flags=re.IGNORECASE,
-    )
-
-    for match in section_pattern.finditer(flat):
-        label = match.group("label").lower()
-        body = normalize_single_line(match.group("body"))
-        role = ROLE_KEYWORDS.get(label, "unknown")
-
-        inn_match = INN_PATTERN.search(body)
-        kpp_match = KPP_PATTERN.search(body)
-
-        inn = normalize_inn(inn_match.group(1)) if inn_match else None
-        kpp = normalize_kpp(kpp_match.group(1)) if kpp_match else None
-
-        name_fragment = body
-        if inn_match:
-            name_fragment = body[: inn_match.start()]
-        name = _extract_org_name_from_fragment(name_fragment)
-
-        if not inn and not name:
-            continue
-
-        parties.append(
-            Counterparty(
-                name=field(name, 0.78 if name else 0.0, f"role_section:{label}:name" if name else "not_found"),
-                inn=field(inn, 0.97 if inn else 0.0, f"role_section:{label}:inn" if inn else "not_found"),
-                kpp=field(kpp, 0.94 if kpp else 0.0, f"role_section:{label}:kpp" if kpp else "not_found"),
-                role=role,  # type: ignore[arg-type]
-            )
-        )
-
-    return parties
-
-
-def _find_counterparties_by_inn_fallback(text: str, existing: Sequence[Counterparty]) -> List[Counterparty]:
-    flat = normalize_single_line(text)
-    existing_inns = {p.inn.value for p in existing if p.inn.value}
-
-    inns = [(m.start(), m.end(), normalize_inn(m.group(1))) for m in INN_PATTERN.finditer(flat)]
-    kpps = [(m.start(), m.end(), normalize_kpp(m.group(1))) for m in KPP_PATTERN.finditer(flat)]
-
-    parties: List[Counterparty] = []
-
-    for idx, (start, end, inn) in enumerate(inns):
-        if not inn or inn in existing_inns:
-            continue
-
-        nearest_kpp = _nearest_value(start, kpps, max_distance=150)
-        role = "seller" if idx == 0 else "buyer"
-        name = _guess_org_name_before_position(flat, start)
-
-        parties.append(
-            Counterparty(
-                name=field(name, 0.52 if name else 0.0, "fallback:context_before_inn" if name else "not_found"),
-                inn=field(inn, 0.92, "fallback:regex_inn"),
-                kpp=field(nearest_kpp, 0.78 if nearest_kpp else 0.0, "fallback:nearest_kpp" if nearest_kpp else "not_found"),
-                role=role,  # type: ignore[arg-type]
-            )
-        )
-
-    return parties
-
-
-def _extract_org_name_from_fragment(fragment: str) -> Optional[str]:
-    fragment = normalize_single_line(fragment)
-    fragment = fragment.strip(" .,:;")
-
-    # Убираем вводные слова, которые часто остаются в секции.
-    fragment = re.sub(
-        r"^(?:организация|наименование|контрагент)\s*[:\-]?\s*",
-        "",
-        fragment,
-        flags=re.IGNORECASE,
-    ).strip()
-
-    patterns = [
-        r"((?:ООО|АО|ПАО|ЗАО|ОАО|ИП)\s+[«\"']?[^,;:]{2,120})",
-        r"((?:Общество\s+с\s+ограниченной\s+ответственностью)\s+[«\"']?[^,;:]{2,120})",
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, fragment, flags=re.IGNORECASE)
-        if match:
-            return normalize_org_name(match.group(1))
-
-    return normalize_org_name(fragment)
-
-
-def _guess_org_name_before_position(flat_text: str, position: int) -> Optional[str]:
-    start = max(0, position - 220)
-    fragment = flat_text[start:position]
-    return _extract_org_name_from_fragment(fragment)
-
-
-def _nearest_value(position: int, values: Iterable[Tuple[int, int, Optional[str]]], max_distance: int) -> Optional[str]:
-    best: Tuple[int, Optional[str]] | None = None
-
-    for start, end, value in values:
-        if value is None:
-            continue
-        distance = min(abs(position - start), abs(position - end))
-        if distance <= max_distance and (best is None or distance < best[0]):
-            best = (distance, value)
-
-    return best[1] if best else None
-
-
-def _deduplicate_parties(parties: Sequence[Counterparty]) -> List[Counterparty]:
-    result: List[Counterparty] = []
-    seen: set[Tuple[Optional[str], str]] = set()
-
-    for party in parties:
-        key = (party.inn.value, party.role)
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(party)
-
-    return result
-
-
-def _find_items(text: str, table_rows: Sequence[Sequence[str]]) -> List[LineItem]:
-    items: List[LineItem] = []
-
-    items.extend(_find_items_from_table_rows(table_rows))
-    existing_keys = {_item_key(item) for item in items}
-
-    for item in _find_items_from_text(text):
-        key = _item_key(item)
-        if key not in existing_keys:
-            items.append(item)
-            existing_keys.add(key)
-
-    return items
-
-
-def _find_items_from_table_rows(table_rows: Sequence[Sequence[str]]) -> List[LineItem]:
-    if not table_rows:
-        return []
-
-    items: List[LineItem] = []
-    header_map: Optional[Dict[str, int]] = None
-
-    for row in table_rows:
-        clean_row = [normalize_single_line(cell) for cell in row]
-        if not any(clean_row):
-            continue
-
-        maybe_header = _detect_header(clean_row)
-        if maybe_header:
-            header_map = maybe_header
-            continue
-
-        if header_map:
-            item = _parse_item_from_mapped_row(clean_row, header_map)
-            if item:
-                items.append(item)
-        else:
-            # Если JSON дал строки без заголовка, собираем строку и используем text fallback.
-            line = " ".join(clean_row)
-            item = _parse_item_line(line)
-            if item:
-                items.append(item)
-
-    return items
-
-
-def _detect_header(row: Sequence[str]) -> Optional[Dict[str, int]]:
-    lower = [cell.lower() for cell in row]
-    mapping: Dict[str, int] = {}
-
-    for logical_name, aliases in HEADER_ALIASES.items():
-        for idx, cell in enumerate(lower):
-            if any(alias in cell for alias in aliases):
-                mapping[logical_name] = idx
-                break
-
-    if "name" in mapping and ("amount" in mapping or "price" in mapping):
-        return mapping
-
-    return None
-
-
-def _parse_item_from_mapped_row(row: Sequence[str], mapping: Dict[str, int]) -> Optional[LineItem]:
-    def get(name: str) -> Optional[str]:
-        idx = mapping.get(name)
-        if idx is None or idx >= len(row):
-            return None
-        return row[idx]
-
-    name = normalize_single_line(get("name"))
-    quantity = normalize_amount(get("quantity"))
-    price = normalize_amount(get("price"))
-    amount = normalize_amount(get("amount"))
-    unit = normalize_unit(get("unit"))
-
-    if not name or amount is None:
-        return None
-
-    confidence = _score_item(quantity, price, amount, base=0.88)
-
-    return LineItem(
-        name=field(name, confidence, "table_cells:name"),
-        quantity=field(quantity, confidence if quantity is not None else 0.0, "table_cells:quantity" if quantity is not None else "not_found"),
-        price=field(price, confidence if price is not None else 0.0, "table_cells:price" if price is not None else "not_found"),
-        amount=field(amount, confidence, "table_cells:amount"),
-        unit=field(unit, 0.8 if unit else 0.0, "table_cells:unit" if unit else "not_found"),
-    )
-
-
-def _find_items_from_text(text: str) -> List[LineItem]:
-    lines = [
-        normalize_single_line(line)
-        for line in normalize_text(text).splitlines()
-        if normalize_single_line(line)
-    ]
-
-    lines = [
-        line
-        for line in lines
-        if not _looks_like_table_header(line) and not _looks_like_non_item_line(line)
-    ]
-
-    items: List[LineItem] = []
-    i = 0
-
-    while i < len(lines):
-        line = lines[i]
-        item = _parse_item_line(line)
-
-        # Multiline fallback: название на одной строке, числа на следующей.
-        # Не склеиваем служебные строки документа с позициями.
-        if item is None and i + 1 < len(lines):
-            combined = f"{line} {lines[i + 1]}"
-            item = _parse_item_line(combined)
-            if item is not None:
-                i += 1
-
-        if item is not None:
-            items.append(item)
-
-        i += 1
-
-    return items
-
-
-def _parse_item_line(line: str) -> Optional[LineItem]:
-    line = normalize_single_line(line)
-    if not line:
-        return None
-
-    # Не парсим строки итогов как позиции.
-    if re.search(r"\b(?:итого|всего|ндс|сумма\s+к\s+оплате|к\s+оплате)\b", line, flags=re.IGNORECASE):
-        return None
-
-    numeric_matches = list(ITEM_NUMBER_PATTERN.finditer(line))
-    if len(numeric_matches) < 3:
-        return None
-
-    # Если первая цифра — номер строки, исключаем её.
-    if numeric_matches and numeric_matches[0].start() <= 2 and len(numeric_matches) >= 4:
-        numeric_matches = numeric_matches[1:]
-
-    if len(numeric_matches) < 3:
-        return None
-
-    quantity_match, price_match, amount_match = numeric_matches[-3:]
-
-    quantity = normalize_amount(quantity_match.group(0))
-    price = normalize_amount(price_match.group(0))
-    amount = normalize_amount(amount_match.group(0))
-
-    if amount is None:
-        return None
-
-    name_fragment = line[: quantity_match.start()]
-    name_fragment = re.sub(r"^\s*\d{1,3}[\).]?\s+", "", name_fragment)
-    name = normalize_single_line(name_fragment).strip(" .,:;-")
-
-    if not name or len(name) < 2:
-        return None
-
-    # Единица измерения обычно стоит между количеством и ценой.
-    between_qty_price = line[quantity_match.end(): price_match.start()]
-    unit_match = UNIT_PATTERN.search(between_qty_price)
-    unit = normalize_unit(unit_match.group(1)) if unit_match else None
-
-    confidence = _score_item(quantity, price, amount, base=0.78)
-
-    return LineItem(
-        name=field(name, confidence, "text_line:name"),
-        quantity=field(quantity, confidence if quantity is not None else 0.0, "text_line:quantity" if quantity is not None else "not_found"),
-        price=field(price, confidence if price is not None else 0.0, "text_line:price" if price is not None else "not_found"),
-        amount=field(amount, confidence, "text_line:amount"),
-        unit=field(unit, 0.66 if unit else 0.0, "text_line:unit" if unit else "not_found"),
-    )
-
-
-def _score_item(quantity: Optional[float], price: Optional[float], amount: Optional[float], base: float) -> float:
-    if quantity is not None and price is not None and amount is not None:
-        if amounts_close(quantity * price, amount, tolerance=max(0.03, amount * 0.01)):
-            return min(0.97, base + 0.12)
-        return max(0.5, base - 0.18)
-    return base
-
-
-def _looks_like_non_item_line(line: str) -> bool:
-    lower = line.lower()
-
-    # Строки шапки документа и контрагентов не должны становиться товарными позициями.
-    # Важно: ищем по словам, иначе "разработки" содержит "акт" и ошибочно отсекается.
-    if re.search(r"\b(?:сч[её]т|счет|акт|накладная|договор|упд|счет-фактура)\b", lower):
-        return True
-
-    if re.search(
-        r"\b(?:поставщик|продавец|исполнитель|подрядчик|покупатель|заказчик|плательщик|грузополучатель|инн|кпп|дата|номер\s+документа)\b",
-        lower,
-    ):
-        return True
-
-    if re.search(r"\b(?:итого|всего|ндс|сумма\s+к\s+оплате|к\s+оплате)\b", lower):
-        return True
-
-    return False
-
-
-def _looks_like_table_header(line: str) -> bool:
-    lower = line.lower()
-    header_words = ("наименование", "кол-во", "количество", "цена", "сумма", "стоимость")
-    return sum(1 for word in header_words if word in lower) >= 2
-
-
-def _item_key(item: LineItem) -> Tuple[Any, Any, Any]:
-    return (item.name.value, item.quantity.value, item.amount.value)
-
-
-def _parse_rows_structure(rows: Any) -> List[List[str]]:
-    parsed: List[List[str]] = []
-    if not isinstance(rows, list):
-        return parsed
-
-    for row in rows:
-        if isinstance(row, list):
-            parsed.append([_cell_text(cell) for cell in row])
-        elif isinstance(row, dict):
-            cells = row.get("cells")
-            if isinstance(cells, list):
-                parsed.append([_cell_text(cell) for cell in cells])
-    return parsed
-
-
-def _parse_cells_structure(cells: Any) -> List[List[str]]:
-    if not isinstance(cells, list):
-        return []
-
-    grouped: Dict[int, Dict[int, str]] = {}
-    fallback_row = 0
-
-    for idx, cell in enumerate(cells):
-        if not isinstance(cell, dict):
-            continue
-
-        row_idx = _first_int(cell, ("rowIndex", "row_index", "row", "row_id"))
-        col_idx = _first_int(cell, ("columnIndex", "column_index", "col", "column", "col_id"))
-
-        if row_idx is None:
-            row_idx = fallback_row
-        if col_idx is None:
-            col_idx = idx
-
-        grouped.setdefault(row_idx, {})[col_idx] = _cell_text(cell)
-
-    rows: List[List[str]] = []
-    for row_idx in sorted(grouped):
-        cols = grouped[row_idx]
-        rows.append([cols[col_idx] for col_idx in sorted(cols)])
-    return rows
-
-
-def _first_int(obj: Dict[str, Any], keys: Sequence[str]) -> Optional[int]:
-    for key in keys:
-        value = obj.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
-    return None
-
-
-def _cell_text(cell: Any) -> str:
-    if isinstance(cell, str):
-        return normalize_single_line(cell)
-    if not isinstance(cell, dict):
-        return ""
-
-    for key in ("text", "fullText", "value", "content"):
-        value = cell.get(key)
-        if isinstance(value, str):
-            return normalize_single_line(value)
-        if isinstance(value, dict) and isinstance(value.get("text"), str):
-            return normalize_single_line(value["text"])
-
-    return ""
-
-
-def _build_warnings(document: DocumentInfo, counterparties: Sequence[Counterparty], items: Sequence[LineItem]) -> List[str]:
-    warnings: List[str] = []
-
-    if document.type.value is None:
-        warnings.append("Не удалось определить тип документа")
-    if document.number.value is None:
-        warnings.append("Не удалось найти номер документа")
-    if document.date.value is None:
-        warnings.append("Не удалось найти дату документа")
-    if document.total_amount.value is None:
-        warnings.append("Не удалось найти итоговую сумму")
-    if not counterparties:
-        warnings.append("Не удалось найти контрагентов")
-    if not items:
-        warnings.append("Не удалось извлечь табличные позиции")
-
-    return warnings

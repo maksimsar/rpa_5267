@@ -17,7 +17,7 @@
     },
     {
       "type": "input_value",
-      "name": "FILE_PATH",
+      "name": "path_file",
       "check": "String"
     },
     {
@@ -52,6 +52,10 @@
         ]
       ]
     }
+  ],
+  "extensions": [
+    "Interface_path_search_init",
+    "Interface_path_search_mixin"
   ],
   "inputsInline": false,
   "output": null,

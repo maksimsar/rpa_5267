@@ -1,7 +1,5 @@
-import base64
 import json
 import os
-import re
 from typing import Any, Dict, Optional
 
 try:
@@ -9,6 +7,7 @@ try:
 except ModuleNotFoundError:
     requests = None
 
+from .parser import parse_requisites_simple
 from .yandex_client import call_yandex_vision
 
 try:
@@ -22,10 +21,7 @@ except Exception:
         return func
 
 
-YANDEX_VISION_URL = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
-
-
-def _error(code: str, message: str, details: Optional[str] = None) -> Dict[str, Any]:
+def _error(code: str, message: str, details: Optional[Any] = None) -> Dict[str, Any]:
     return {
         "success": False,
         "error": {
@@ -35,82 +31,26 @@ def _error(code: str, message: str, details: Optional[str] = None) -> Dict[str, 
         },
     }
 
+
+def _clean_text(value: Any) -> str:
+    """
+    Очищает входы из Puzzle RPA от None, пробелов и случайных кавычек.
+    """
+    if value is None:
+        return ""
+    return str(value).strip().strip('"').strip("'")
+
+
 def _format_result(result: Dict[str, Any], output_format: str):
+    """
+    Возвращает результат в нужном формате: dict или красивый JSON.
+    """
+    output_format = _clean_text(output_format).lower() or "dict"
+
     if output_format == "json":
         return json.dumps(result, ensure_ascii=False, indent=2)
+
     return result
-
-
-def _extract_text_from_response(response_json: Dict[str, Any]) -> str:
-    """Минимальное извлечение текста из ответа Yandex Vision.
-
-    В финальной версии эту функцию стоит расширить под полный формат ответа
-    DOCUMENT_RECOGNITION: страницы, блоки, строки, таблицы.
-    """
-    chunks = []
-
-    def walk(obj: Any):
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key in ("text", "fullText") and isinstance(value, str):
-                    chunks.append(value)
-                else:
-                    walk(value)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    walk(response_json)
-    return "\n".join(dict.fromkeys(chunks))
-
-
-def _parse_requisites(text: str) -> Dict[str, Any]:
-    """Базовый regex-парсер. Нужен как минимальная стартовая версия."""
-    normalized = re.sub(r"\s+", " ", text or "").strip()
-
-    doc_type = None
-    for candidate in ["УПД", "Акт", "Накладная", "Счёт", "Счет", "Договор"]:
-        if re.search(candidate, normalized, flags=re.IGNORECASE):
-            doc_type = candidate
-            break
-
-    number_match = re.search(r"(?:№|N|Номер[:\s]*)\s*([A-Za-zА-Яа-я0-9\-\/]+)", normalized, re.IGNORECASE)
-    date_match = re.search(r"\b(\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2})\b", normalized)
-    inn_match = re.search(r"\bИНН\s*[:№]?\s*(\d{10}|\d{12})\b", normalized, re.IGNORECASE)
-    kpp_match = re.search(r"\bКПП\s*[:№]?\s*(\d{9})\b", normalized, re.IGNORECASE)
-    amount_match = re.search(
-        r"(?:Итого|Всего|Сумма)\s*[:\-]?\s*([0-9\s]+(?:[,.]\d{2})?)",
-        normalized,
-        re.IGNORECASE
-    )
-
-    amount = None
-    if amount_match:
-        raw_amount = amount_match.group(1).replace(" ", "").replace(",", ".")
-        try:
-            amount = float(raw_amount)
-        except ValueError:
-            amount = None
-
-    return {
-        "document": {
-            "type": doc_type,
-            "number": number_match.group(1) if number_match else None,
-            "date": date_match.group(1) if date_match else None,
-            "total_amount": amount,
-        },
-        "counterparties": [
-            {
-                "name": None,
-                "inn": inn_match.group(1) if inn_match else None,
-                "kpp": kpp_match.group(1) if kpp_match else None,
-                "role": None,
-            }
-        ],
-        "items": [],
-        "raw_text": text,
-        "warnings": [],
-    }
 
 
 @window_logger
@@ -122,12 +62,32 @@ def process_pdf(
     language: str = "ru",
     output_format: str = "dict",
     timeout: int = 45,
+    puzzle_logger_path=None,
+    block_text=None,
+    block_id=None,
+    window_log=False,
+    current_language=None,
+    **kwargs,
 ):
-    """Главная функция блока Puzzle RPA.
+    """
+    Главная функция блока Puzzle RPA.
 
-    Принимает PDF, отправляет в Yandex Vision, возвращает dict или JSON-строку.
+    Важно:
+    - токен приходит из поля TOKEN блока;
+    - folder_id приходит из поля FOLDER_ID;
+    - file_path приходит из поля FILE_PATH;
+    - OCR-запрос делает yandex_client.py;
+    - парсинг делает parser.py.
+
+    Возвращает dict или JSON-строку.
     """
     try:
+        token = _clean_text(token)
+        folder_id = _clean_text(folder_id)
+        file_path = _clean_text(file_path)
+        language = _clean_text(language) or "ru"
+        output_format = _clean_text(output_format).lower() or "dict"
+
         if requests is None:
             return _format_result(
                 _error(
@@ -136,17 +96,24 @@ def process_pdf(
                 ),
                 output_format,
             )
+
         if not token:
-            result = _error("EMPTY_TOKEN", "Не передан OAuth-токен Yandex Cloud")
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("EMPTY_TOKEN", "Не передан токен Yandex Cloud"),
+                output_format,
+            )
 
         if not folder_id:
-            result = _error("EMPTY_FOLDER_ID", "Не передан Folder ID Yandex Cloud")
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("EMPTY_FOLDER_ID", "Не передан Folder ID Yandex Cloud"),
+                output_format,
+            )
 
         if not file_path or not os.path.exists(file_path):
-            result = _error("FILE_NOT_FOUND", "PDF-файл не найден", file_path)
-            return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+            return _format_result(
+                _error("FILE_NOT_FOUND", "PDF-файл не найден", file_path),
+                output_format,
+            )
 
         vision_result = call_yandex_vision(
             token=token,
@@ -157,28 +124,21 @@ def process_pdf(
         )
 
         if not vision_result.get("success"):
-            return json.dumps(vision_result, ensure_ascii=False) if output_format == "json" else vision_result
+            return _format_result(vision_result, output_format)
 
-        vision_json = vision_result["data"]
+        vision_json = vision_result.get("data", {})
+        parsed = parse_requisites_simple(vision_json)
 
-        text = _extract_text_from_response(vision_json)
-        parsed = _parse_requisites(text)
+        if "success" not in parsed:
+            parsed = {
+                "success": True,
+                **parsed,
+            }
 
-        result = {
-            "success": True,
-            **parsed,
-        }
-
-        return json.dumps(result, ensure_ascii=False, indent=2) if output_format == "json" else result
-
-    except requests.Timeout:
-        result = _error("TIMEOUT", "Yandex Vision не ответил за отведённое время")
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
-
-    except requests.RequestException as exc:
-        result = _error("NETWORK_ERROR", "Сетевая ошибка при обращении к Yandex Vision", str(exc))
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+        return _format_result(parsed, output_format)
 
     except Exception as exc:
-        result = _error("UNKNOWN_ERROR", "Непредвиденная ошибка блока", str(exc))
-        return json.dumps(result, ensure_ascii=False) if output_format == "json" else result
+        return _format_result(
+            _error("UNKNOWN_ERROR", "Непредвиденная ошибка блока", str(exc)),
+            output_format if "output_format" in locals() else "dict",
+        )
