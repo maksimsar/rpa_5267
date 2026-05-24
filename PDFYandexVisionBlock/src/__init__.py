@@ -33,18 +33,14 @@ def _error(code: str, message: str, details: Optional[Any] = None) -> Dict[str, 
 
 
 def _clean_text(value: Any) -> str:
-    """
-    Очищает входы из Puzzle RPA от None, пробелов и случайных кавычек.
-    """
+    # Чистим значения из полей блока.
     if value is None:
         return ""
     return str(value).strip().strip('"').strip("'")
 
 
 def _format_result(result: Dict[str, Any], output_format: str):
-    """
-    Возвращает результат в нужном формате: dict или красивый JSON.
-    """
+    # Возвращаем dict или JSON-строку.
     output_format = _clean_text(output_format).lower() or "dict"
 
     if output_format == "json":
@@ -69,18 +65,7 @@ def process_pdf(
     current_language=None,
     **kwargs,
 ):
-    """
-    Главная функция блока Puzzle RPA.
-
-    Важно:
-    - токен приходит из поля TOKEN блока;
-    - folder_id приходит из поля FOLDER_ID;
-    - file_path приходит из поля FILE_PATH;
-    - OCR-запрос делает yandex_client.py;
-    - парсинг делает parser.py.
-
-    Возвращает dict или JSON-строку.
-    """
+    # Точка входа блока Puzzle RPA.
     try:
         token = _clean_text(token)
         folder_id = _clean_text(folder_id)

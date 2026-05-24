@@ -1,18 +1,4 @@
-"""
-schema.py
-
-Production-like схема результата для слоя извлечения реквизитов.
-
-Файл не зависит от Puzzle RPA, Yandex Vision, requests и файловой системы.
-Его задача — дать единый формат результата, который удобно:
-- тестировать;
-- логировать;
-- отдавать из Puzzle RPA как dict/json;
-- защищать перед жюри как продуманную архитектуру.
-
-Python: 3.11+
-Dependencies: стандартная библиотека.
-"""
+# Схема результата распознавания реквизитов.
 
 from __future__ import annotations
 
@@ -43,19 +29,7 @@ PartyRole = Literal[
 
 @dataclass(frozen=True)
 class FieldValue:
-    """Значение поля с объяснением, как оно было найдено.
-
-    value:
-        Само значение. Если не найдено — None.
-
-    confidence:
-        Эвристическая уверенность 0..1. Это не ML-score, а объяснимый скоринг
-        по качеству паттерна: ключевые слова, роль, таблица, fallback.
-
-    source:
-        Объяснение источника: regex, table_cell, role_section, fallback.
-    """
-
+    # Значение поля и источник его распознавания.
     value: Any = None
     confidence: float = 0.0
     source: str = "not_found"
@@ -125,14 +99,7 @@ class ParseResult:
     meta: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self, include_explainability: bool = True) -> Dict[str, Any]:
-        """Преобразовать результат в dict.
-
-        include_explainability=True — лучший формат для хакатона:
-        жюри видит confidence/source.
-
-        include_explainability=False — компактный формат:
-        удобен для expected_output.json и сравнения.
-        """
+        # Переводим dataclass-результат в обычный dict.
         if include_explainability:
             return {
                 "success": self.success,
@@ -178,7 +145,7 @@ class ParseResult:
 
 
 def field(value: Any, confidence: float, source: str) -> FieldValue:
-    """Короткий helper для единообразного создания FieldValue."""
+    # Создаём FieldValue с округлённой уверенностью.
     return FieldValue(value=value, confidence=round(float(confidence), 3), source=source)
 
 

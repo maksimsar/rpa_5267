@@ -1,13 +1,4 @@
-"""
-tools/run_parser_demo.py
-
-Локальное демо без Puzzle RPA и без Yandex Vision.
-Нужно Максиму С, чтобы показывать свою часть независимо от остальных.
-
-Запуск:
-    python tools/run_parser_demo.py
-    python tools/validate_output.py examples/demo_result.json
-"""
+# Локальное демо парсера без Puzzle RPA и Yandex OCR.
 
 from __future__ import annotations
 
