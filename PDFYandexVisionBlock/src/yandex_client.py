@@ -19,31 +19,20 @@ OCR_ASYNC_POLL_INTERVAL_SECONDS = 5
 
 
 def _clean_text(value: Any) -> str:
-    """
-    Приводит вход из Puzzle RPA к обычной строке:
-    убирает None, пробелы и случайные кавычки по краям.
-    """
+    # Чистим значения из Puzzle RPA.
     if value is None:
         return ""
     return str(value).strip().strip('"').strip("'")
 
 
 def _is_oauth_token(token: str) -> bool:
-    """
-    OAuth-токен Яндекса обычно начинается с y0_.
-    IAM-токен обычно начинается с t1.
-    """
+    # Отличаем OAuth-токен от IAM-токена.
     token = _clean_text(token)
     return token.startswith("y0_")
 
 
 def _get_iam_token(oauth_token: str, timeout: int = 15) -> Dict[str, Any]:
-    """
-    Получает IAM-токен по OAuth-токену.
-
-    Это нужно, чтобы пользователь мог вставить OAuth-токен прямо в блок Puzzle RPA,
-    а код сам получил временный IAM-токен для Yandex OCR API.
-    """
+    # Получаем временный IAM-токен.
     oauth_token = _clean_text(oauth_token)
 
     if not oauth_token:
@@ -111,10 +100,7 @@ def _get_iam_token(oauth_token: str, timeout: int = 15) -> Dict[str, Any]:
 
 
 def _normalize_language(language: str) -> List[str]:
-    """
-    Приводит значение из выпадающего списка Puzzle RPA
-    к списку языков для Yandex OCR API.
-    """
+    # Приводим выбор языка к формату Yandex OCR.
     language = _clean_text(language).lower() or "ru"
 
     if language in ("ru-en", "ru_en", "ru + en", "russian + english", "both", "mixed", "русский + английский"):
@@ -133,9 +119,7 @@ def _normalize_language(language: str) -> List[str]:
 
 
 def _validate_pdf_file(file_path: str) -> Optional[Dict[str, Any]]:
-    """
-    Проверяет существование PDF-файла и базовые ограничения OCR API.
-    """
+    # Проверяем файл перед отправкой в OCR.
     file_path = _clean_text(file_path)
 
     if not file_path:
@@ -184,19 +168,13 @@ def _validate_pdf_file(file_path: str) -> Optional[Dict[str, Any]]:
 
 
 def _read_file_base64(file_path: str) -> str:
-    """
-    Читает PDF и возвращает base64-строку.
-    """
+    # Кодируем PDF для API.
     with open(file_path, "rb") as file:
         return base64.b64encode(file.read()).decode("utf-8")
 
 
 def _build_ocr_payload(encoded_pdf: str, language: str) -> Dict[str, Any]:
-    """
-    Формирует payload для Yandex OCR API.
-
-    Для PDF используем async OCR API, потому что он подходит для многостраничных документов.
-    """
+    # Собираем тело запроса OCR.
     language_codes = _normalize_language(language)
 
     return {
@@ -208,10 +186,7 @@ def _build_ocr_payload(encoded_pdf: str, language: str) -> Dict[str, Any]:
 
 
 def _build_ocr_headers(token: str, folder_id: str) -> Dict[str, str]:
-    """
-    Заголовки для OCR API.
-    Folder ID передаётся через x-folder-id.
-    """
+    # Заголовки авторизации Yandex OCR.
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {token}",
@@ -221,9 +196,7 @@ def _build_ocr_headers(token: str, folder_id: str) -> Dict[str, str]:
 
 
 def _safe_response_body(response: requests.Response) -> Any:
-    """
-    Безопасно достаёт тело HTTP-ответа.
-    """
+    # Возвращаем JSON или короткий текст ответа.
     try:
         return response.json()
     except ValueError:
@@ -235,9 +208,7 @@ def _parse_http_error(
     default_code: str,
     default_message: str,
 ) -> Dict[str, Any]:
-    """
-    Универсально разбирает HTTP-ошибку в единый формат.
-    """
+    # Переводим HTTP-ошибку в формат блока.
     details = _safe_response_body(response)
     status_code = response.status_code
 
@@ -291,13 +262,7 @@ def _parse_http_error(
 
 
 def _parse_json_or_json_lines(response: requests.Response) -> Dict[str, Any]:
-    """
-    Разбирает ответ Yandex OCR.
-
-    Обычно это обычный JSON.
-    Но если сервис вернёт несколько JSON-секций построчно,
-    мы тоже не падаем, а собираем их в pages.
-    """
+    # Поддерживаем JSON и построчный JSON.
     try:
         data = response.json()
         if isinstance(data, dict):
@@ -334,12 +299,7 @@ def _parse_json_or_json_lines(response: requests.Response) -> Dict[str, Any]:
 
 
 def _is_operation_not_ready(response: requests.Response) -> bool:
-    """
-    Проверяет, что async-операция ещё не готова.
-
-    У разных API это может выглядеть по-разному,
-    поэтому проверка мягкая, а не хрупкая до истерики.
-    """
+    # Мягко определяем незавершённую async-операцию.
     if response.status_code in (202, 204, 408, 409, 425, 429):
         return True
 
@@ -368,11 +328,7 @@ def _call_yandex_ocr_async_pdf(
     max_wait_seconds: int = OCR_ASYNC_MAX_WAIT_SECONDS,
     poll_interval_seconds: int = OCR_ASYNC_POLL_INTERVAL_SECONDS,
 ) -> Dict[str, Any]:
-    """
-    Асинхронно распознаёт PDF через Yandex OCR API.
-
-    Подходит для многостраничных и более тяжёлых PDF.
-    """
+    # Запускаем OCR и ждём результат операции.
     payload = _build_ocr_payload(encoded_pdf, language)
     headers = _build_ocr_headers(token, folder_id)
 
@@ -536,28 +492,7 @@ def call_yandex_vision(
     language: str = "ru",
     timeout: int = 45,
 ) -> Dict[str, Any]:
-    """
-    Отправляет PDF в Yandex OCR API и возвращает JSON-ответ.
-
-    Функция называется call_yandex_vision для совместимости с остальным проектом,
-    но внутри используется новый OCR API recognizeTextAsync.
-
-    Возвращает:
-    {
-        "success": true,
-        "data": {...}
-    }
-
-    или:
-    {
-        "success": false,
-        "error": {
-            "code": "...",
-            "message": "...",
-            "details": ...
-        }
-    }
-    """
+    # Публичный клиент OCR для блока.
     token = _clean_text(token)
     folder_id = _clean_text(folder_id)
     file_path = _clean_text(file_path)

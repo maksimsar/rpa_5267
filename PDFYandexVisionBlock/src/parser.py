@@ -1,13 +1,4 @@
-"""
-parser.py
-
-Автономный слой парсинга OCR-результата.
-
-Главная идея:
-- parse_requisites(...) возвращает explainable-формат для тестов и архитектуры:
-  {"value": ..., "confidence": ..., "source": ...}
-- parse_requisites_simple(...) возвращает компактный формат для Puzzle RPA.
-"""
+# Парсинг OCR-ответа в реквизиты документа.
 
 from __future__ import annotations
 
@@ -27,22 +18,13 @@ def _field(value: Any = None, confidence: float = 0.0, source: str = "not_found"
 
 
 def parse_requisites(vision_response: Dict[str, Any] | str | None) -> Dict[str, Any]:
-    """
-    Возвращает explainable-формат:
-    каждое значимое поле лежит в {"value", "confidence", "source"}.
-
-    Этот формат ждут unit-тесты и он удобен для защиты:
-    можно объяснить, как именно найдено поле.
-    """
+    # Возвращаем формат с value/confidence/source.
     compact = parse_requisites_simple(vision_response)
     return make_explainable_result(compact)
 
 
 def parse_requisites_simple(vision_response: Dict[str, Any] | str | None) -> Dict[str, Any]:
-    """
-    Возвращает компактный формат для Puzzle RPA:
-    document.type -> "Счёт", а не {"value": "Счёт", ...}.
-    """
+    # Возвращаем компактный формат для Puzzle RPA.
     raw_text = extract_text_from_vision_response(vision_response)
     table_rows = extract_table_rows_from_vision_response(vision_response)
     parsed = parse_text(raw_text, table_rows=table_rows)
@@ -60,9 +42,7 @@ def parse_requisites_simple(vision_response: Dict[str, Any] | str | None) -> Dic
 
 
 class ParserResult(dict):
-    """
-    Совместимость с кодом, который мог ждать .to_dict().
-    """
+    # Совместимость со старым вызовом .to_dict().
     def to_dict(self, include_explainability: bool = True) -> Dict[str, Any]:
         if include_explainability:
             return dict(self)
@@ -273,10 +253,7 @@ def extract_text_value(value: Any) -> str:
 
 
 def extract_table_rows_from_vision_response(vision_response: Dict[str, Any] | str | None) -> List[List[str]]:
-    """
-    Достаёт таблицы из JSON вида:
-    {"tables": [{"cells": [{"rowIndex": 0, "columnIndex": 0, "text": "..."}]}]}.
-    """
+    # Достаём таблицы из OCR JSON.
     if not isinstance(vision_response, dict):
         return []
 
@@ -855,14 +832,7 @@ def find_org_entries(flat: str) -> List[Dict[str, Any]]:
 
 
 def fill_missing_party_ids(parties: List[Dict[str, Any]], flat: str) -> List[Dict[str, Any]]:
-    """
-    Дозаполняет ИНН/КПП только там, где это безопасно.
-
-    Важно:
-    - ИП / физлица с 12-значным ИНН обычно не имеют КПП;
-    - нельзя брать первый найденный КПП из всего документа и лепить его первому контрагенту;
-    - особенно нельзя присваивать КПП исполнителю, если это ИП.
-    """
+    # Безопасно дозаполняем ИНН и КПП.
     all_inns = find_all_inn(flat)
     all_kpps = find_all_kpp(flat)
 

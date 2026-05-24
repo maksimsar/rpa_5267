@@ -1,16 +1,4 @@
-"""
-normalizer.py
-
-Устойчивые функции нормализации OCR-результата.
-
-Этот модуль специально изолирован:
-- не знает про Puzzle RPA;
-- не знает про Yandex Vision;
-- не делает HTTP;
-- не читает файлы.
-
-Именно поэтому его легко покрывать тестами.
-"""
+# Нормализация OCR-текста и реквизитов.
 
 from __future__ import annotations
 
@@ -71,7 +59,7 @@ COMMON_OCR_WORD_FIXES = {
 
 
 def normalize_text(text: str | None) -> str:
-    """Нормализует многострочный OCR-текст без потери переводов строк."""
+    # Чистим многострочный текст.
     if text is None:
         return ""
 
@@ -94,12 +82,12 @@ def normalize_text(text: str | None) -> str:
 
 
 def normalize_single_line(text: str | None) -> str:
-    """Делает одну чистую строку."""
+    # Склеиваем текст в одну строку.
     return re.sub(r"\s+", " ", normalize_text(text)).strip()
 
 
 def normalize_for_search(text: str | None) -> str:
-    """Нормализация для regex-поиска без изменения исходного raw_text."""
+    # Готовим текст для поиска.
     text = normalize_single_line(text).lower()
     for old, new in COMMON_OCR_WORD_FIXES.items():
         text = text.replace(old, new)
@@ -199,17 +187,7 @@ def normalize_unit(value: str | None) -> Optional[str]:
 
 
 def normalize_amount(value: str | int | float | Decimal | None) -> Optional[float]:
-    """Преобразует сумму/цену/количество в float.
-
-    Поддерживает:
-    - 25 500,50
-    - 25500.50
-    - 25.500,50
-    - 12,345.67
-    - 25 500 руб. 50 коп.
-    - 25500-50
-    - 1 000
-    """
+    # Приводим сумму, цену или количество к float.
     if value is None:
         return None
 
@@ -319,15 +297,7 @@ def _parse_decimal_number(raw: str | None) -> Optional[Decimal]:
 
 
 def normalize_date(value: str | None) -> Optional[str]:
-    """Нормализует дату к YYYY-MM-DD.
-
-    Поддерживает:
-    - 22.05.2026
-    - 22/05/26
-    - 2026-05-22
-    - 22 мая 2026
-    - «22» мая 2026 г.
-    """
+    # Приводим дату к YYYY-MM-DD.
     if value is None:
         return None
 

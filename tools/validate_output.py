@@ -1,9 +1,4 @@
-"""
-Root-level validator for the hackathon handoff.
-
-Usage:
-    python -X utf8 tools\\validate_output.py examples\\expected_output.json
-"""
+# Валидатор результата для сдачи проекта.
 
 from __future__ import annotations
 
